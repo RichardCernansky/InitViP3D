@@ -191,9 +191,12 @@ class NuScenesTrackDatasetRadar(Dataset):
         self.generate_nuscenes_prediction_infos_val = generate_nuscenes_prediction_infos_val
 
     def prepare_nuscenes(self):
-        self.nuscenes = NuScenes('v1.0-trainval/', dataroot=self.data_root)
-        # self.nuscenes = NuScenes('v1.0-mini', dataroot=data_root)
-        self.helper = PredictHelper(self.nuscenes)
+        # _MiniNuScenes instead of NuScenes(): the prediction path only ever looks up
+        # a sample, its scene and that scene's map name, and the full devkit costs
+        # ~13GB and ~135s in every dataloader worker to also parse sample_data,
+        # ego_pose and sample_annotation (see _MiniNuScenes).
+        self.nuscenes = _MiniNuScenes(self.data_root)
+        self.helper = _MiniPredictHelper(self.nuscenes)
         self.maps = load_all_maps(self.helper)
 
     def generate_prediction(self, data_detection, cur_info, index):
@@ -294,7 +297,122 @@ class NuScenesTrackDatasetRadar(Dataset):
                 ret[key].append(value)
         return ret
 
-    def get_pred_agents(self, results, start, end, interval, mapping, data_history=None, aug_state=None):
+    def _history_boxes_only(self, start, end_all, interval, aug_state, prepared):
+        """Per-frame boxes for the prediction targets, without loading any points.
+
+        get_pred_agents reads only boxes, labels, instance ids and the pose out of
+        the history, yet prepare_data_history rebuilds all 15 frames through the
+        full pipeline: ten sweeps loaded per frame, objects pasted and occlusion-
+        filtered against those points, everything rotated. That is ~5.4s per sample
+        spent on point clouds nothing reads -- and since it runs in the dataloader
+        workers alongside the training step, it also starves the step itself
+        (forward measured at 0.48s with idle workers, 0.92s with four busy ones,
+        1.51s with eight). Rebuild the boxes directly instead, applying this clip's
+        own augmentation draw with the same operations in the same order as the
+        pipeline, and reuse the frames the model input already built.
+        """
+        rot = float(aug_state.get('noise_rotation', 0.0)) if aug_state else 0.0
+        scale = float(aug_state.get('pcd_scale_factor', 1.0)) if aug_state else 1.0
+        flip_h = bool(aug_state.get('pcd_horizontal_flip')) if aug_state else False
+        flip_v = bool(aug_state.get('pcd_vertical_flip')) if aug_state else False
+
+        cos, sin = np.cos(rot), np.sin(rot)
+        aug = np.array([[cos, -sin, 0.],                       # mmdet3d's rot_mat_T, i.e. what the
+                        [sin, cos, 0.],                        # pipeline leaves in pcd_rotation
+                        [0., 0., 1.]], dtype=np.float32)
+        if flip_h:
+            aug = aug @ np.diag([1., -1., 1.]).astype(np.float32)
+        if flip_v:
+            aug = aug @ np.diag([-1., 1., 1.]).astype(np.float32)
+
+        bev_range = None
+        for transform in self.pipeline_single.transforms:      # reuse the configured range
+            if type(transform).__name__ == 'InstanceRangeFilter':
+                bev_range = transform.bev_range
+
+        keys = ('gt_bboxes_3d', 'gt_labels_3d', 'instance_inds', 'l2g_r_mat', 'l2g_t')
+        ret = {key: [] for key in keys}
+        for i in range(start, end_all, interval):
+            if not (0 <= i < len(self.data_infos)):
+                return None
+
+            if i - start < len(prepared['gt_bboxes_3d']):      # frames the model input already built
+                for key in keys:
+                    ret[key].append(prepared[key][i - start])
+                continue
+
+            ann = self.get_ann_info(i)
+            boxes, labels = ann['gt_bboxes_3d'], ann['gt_labels_3d']
+            instance_inds = ann['instance_inds']
+            boxes.rotate(rot)                                  # TrackConsistentGlobalRotScaleTrans,
+            boxes.scale(scale)                                 # whose translation_std is 0
+            if flip_h:
+                boxes.flip('horizontal')                       # then TrackConsistentRandomFlip3D
+            if flip_v:
+                boxes.flip('vertical')
+            if bev_range is not None:                          # then InstanceRangeFilter
+                mask = boxes.in_range_bev(bev_range)
+                boxes = boxes[mask]
+                keep = mask.numpy().astype(bool)
+                labels, instance_inds = labels[keep], instance_inds[keep]
+                boxes.limit_yaw(offset=0.5, period=2 * np.pi)
+
+            info = self.get_data_info(i)
+            ret['gt_bboxes_3d'].append(boxes)
+            ret['gt_labels_3d'].append(labels)
+            ret['instance_inds'].append(instance_inds)
+            ret['l2g_r_mat'].append(                           # and finally SyncEgoPoseToAugmentation
+                np.asarray(info['l2g_r_mat'], dtype=np.float32) @ aug)
+            ret['l2g_t'].append(np.asarray(info['l2g_t'], dtype=np.float32) * scale)
+        return ret
+
+    @staticmethod
+    def _drew_geometric_aug(aug_state):
+        """Whether the track-consistent rotation / scale / flip ran for this clip."""
+        return bool(aug_state) and any(
+            k in aug_state for k in ('noise_rotation', 'pcd_scale_factor',
+                                     'pcd_horizontal_flip', 'pcd_vertical_flip'))
+
+    @staticmethod
+    def _move_augmented_box(box, data_history, src, dst):
+        """Re-express a box from augmented frame `src` in augmented frame `dst`.
+
+        Geometric augmentation rewrites each frame's boxes in that frame's own
+        lidar coordinates, so chaining the raw poses from data_infos fabricates
+        motion. SyncEgoPoseToAugmentation re-expresses l2g_r_mat / l2g_t per
+        frame to match; composing two of them is a proper rigid motion even
+        under a flip (the flip enters both), so the box keeps the augmented
+        scene's scale and mirroring -- which the relative prediction targets
+        have to follow, since the model only ever sees the augmented scene.
+        """
+        r_src = np.asarray(data_history['l2g_r_mat'][src], dtype=np.float64)
+        t_src = np.asarray(data_history['l2g_t'][src], dtype=np.float64)
+        r_dst = np.asarray(data_history['l2g_r_mat'][dst], dtype=np.float64)
+        t_dst = np.asarray(data_history['l2g_t'][dst], dtype=np.float64)
+        heading = box.orientation.rotation_matrix[:, 0] @ r_src.T @ r_dst  # row vectors, no translation
+        box = box.copy()
+        box.center = (box.center @ r_src.T + t_src - t_dst) @ r_dst
+        box.orientation = Quaternion(axis=[0, 0, 1], radians=np.arctan2(heading[1], heading[0]))
+        return box
+
+    @staticmethod
+    def _augment_lane(lane, aug_state):
+        """Give ego-centred, map-aligned lane points the augmented scene's scale and handedness.
+
+        Rotation never reaches these lanes (they follow the map axes, not the
+        ego heading); scale does, and so does a mirror, i.e. exactly one BEV
+        flip. With no link to the ego heading any fixed mirror axis is
+        equivalent, so x is used.
+        """
+        if not aug_state:
+            return lane
+        lane = lane * float(aug_state.get('pcd_scale_factor', 1.0))
+        if bool(aug_state.get('pcd_horizontal_flip')) != bool(aug_state.get('pcd_vertical_flip')):
+            lane = lane * np.array([-1.0, 1.0])
+        return lane
+
+    def get_pred_agents(self, results, start, end, interval, mapping, data_history=None, aug_state=None,
+                        prepared=None):
         future_frame_num = 12
         past_frame_num = end - start
         instance_idx_2_labels = {}
@@ -308,7 +426,24 @@ class NuScenesTrackDatasetRadar(Dataset):
 
         same_scene = self.is_the_same_scene(start, end, future_frame_num)
 
-        data_history = self.prepare_data_history(start, end + future_frame_num, interval, aug_state=aug_state)
+        # Nothing below reads points, so rebuild just the boxes rather than running
+        # the whole point-cloud pipeline over these 15 frames again; test mode has no
+        # prepared frames to reuse and keeps the original path (see _history_boxes_only).
+        boxes_only = prepared is not None and not self.test_mode
+        if boxes_only:
+            data_history = self._history_boxes_only(start, end + future_frame_num, interval, aug_state, prepared)
+        else:
+            data_history = self.prepare_data_history(start, end + future_frame_num, interval, aug_state=aug_state)
+
+        # These history boxes went through geometric augmentation, which the raw
+        # lidar2ego / ego2global poses read below know nothing about; when it ran,
+        # trajectories are built in the current augmented lidar frame instead of
+        # the current ego frame (see _move_augmented_box).
+        geometric_aug = self._drew_geometric_aug(aug_state)
+        if geometric_aug:
+            assert any(type(t).__name__ == 'SyncEgoPoseToAugmentation'
+                       for t in self.pipeline_single.transforms), \
+                'prediction targets under geometric augmentation need SyncEgoPoseToAugmentation'
 
         if same_scene and data_history is not None:
 
@@ -344,7 +479,10 @@ class NuScenesTrackDatasetRadar(Dataset):
                 gt_bboxes_3d = data_history['gt_bboxes_3d'][i - start].tensor.numpy()
                 gt_labels_3d = data_history['gt_labels_3d'][i - start]
                 assert len(instance_inds) == len(gt_bboxes_3d) == len(gt_labels_3d)
-                if not self.test_mode:
+                if not self.test_mode and not boxes_only:
+                    # a boxes-only history keeps genuinely empty frames (their instances
+                    # just stay invalid) instead of dropping prediction for the whole
+                    # clip, which pasted objects used to mask here
                     assert len(instance_inds) > 0
 
                 # gt_bboxes_3d = info['gt_boxes'][mask]
@@ -390,9 +528,12 @@ class NuScenesTrackDatasetRadar(Dataset):
                             past_boxes=None,
                             **kwargs):
                         box = utils.get_box_from_array(gt_bboxes_3d[box_idx])
-                        box = utils.get_transform_and_rotate_box(box, l2e_t, l2e_r)
-                        box = utils.get_transform_and_rotate_box(box, e2g_t, e2g_r)
-                        box = utils.get_transform_and_rotate_box(box, cur_e2g_t, cur_e2g_r, reverse=True)
+                        if geometric_aug:
+                            box = self._move_augmented_box(box, data_history, i - start, end - 1 - start)
+                        else:
+                            box = utils.get_transform_and_rotate_box(box, l2e_t, l2e_r)
+                            box = utils.get_transform_and_rotate_box(box, e2g_t, e2g_r)
+                            box = utils.get_transform_and_rotate_box(box, cur_e2g_t, cur_e2g_r, reverse=True)
                         point = box.center
 
                         if i < end:
@@ -433,7 +574,7 @@ class NuScenesTrackDatasetRadar(Dataset):
 
         results['instance_idx_2_labels'] = instance_idx_2_labels
 
-    def get_pred_lanes(self, results, start, end, interval, mapping):
+    def get_pred_lanes(self, results, start, end, interval, mapping, aug_state=None):
         cur_info = self.data_infos[end - 1]
         cur_l2e_r = cur_info['lidar2ego_rotation']
         cur_l2e_t = cur_info['lidar2ego_translation']
@@ -483,6 +624,7 @@ class NuScenesTrackDatasetRadar(Dataset):
                 lane = np.array([point for point in lane if get_dis_point2point(point, (0.0, visible_y)) < max_dis])
                 if len(lane) < 1:
                     continue
+                lane = self._augment_lane(lane, aug_state)  # after the visibility filter, so the same lanes are kept
 
                 polygons.append(lane)
 
@@ -875,7 +1017,7 @@ class NuScenesTrackDatasetRadar(Dataset):
 
         if self.do_pred:
             if True:
-                pred_data = self.prepare_pred(start, end, interval, index, aug_state=aug_state)
+                pred_data = self.prepare_pred(start, end, interval, index, aug_state=aug_state, prepared=ret)
 
             ret.update(pred_data)
 
@@ -887,7 +1029,7 @@ class NuScenesTrackDatasetRadar(Dataset):
 
         return ret
 
-    def prepare_pred(self, start, end, interval, index, aug_state=None):
+    def prepare_pred(self, start, end, interval, index, aug_state=None, prepared=None):
         results = {}
         if not hasattr(self, 'nuscenes'):
             self.prepare_nuscenes()
@@ -896,8 +1038,8 @@ class NuScenesTrackDatasetRadar(Dataset):
 
         mapping = {}
 
-        self.get_pred_agents(results, start, end, interval, mapping, aug_state=aug_state)
-        self.get_pred_lanes(results, start, end, interval, mapping)
+        self.get_pred_agents(results, start, end, interval, mapping, aug_state=aug_state, prepared=prepared)
+        self.get_pred_lanes(results, start, end, interval, mapping, aug_state=aug_state)
 
         info = self.data_infos[end - 1]
         sample = self.helper.data.get('sample', info['token'])
@@ -1390,6 +1532,43 @@ def get_lanes_in_radius(x: float, y: float, radius: float,
     lanes = map_api.discretize_lanes(lanes, discretization_meters)
 
     return lanes
+
+
+class _MiniNuScenes(object):
+    """The three nuScenes tables the prediction path actually reads.
+
+    NuScenes('v1.0-trainval') also parses sample_data (1.3GB), ego_pose (616MB),
+    sample_annotation (556MB), instance and calibrated_sensor -- ~13GB resident and
+    ~135s, paid in every dataloader worker (8 of them at workers_per_gpu=4 on two
+    GPUs). get_pred_lanes and prepare_pred only ever ask for a sample, its scene
+    and the scene's map location, which live in 7.4MB of json.
+    """
+
+    TABLES = ('sample', 'scene', 'log')
+
+    def __init__(self, dataroot, version='v1.0-trainval'):
+        import json
+        self.dataroot = dataroot
+        self.version = version
+        self._tables = {}
+        for table in self.TABLES:
+            with open(osp.join(dataroot, version, table + '.json')) as f:
+                self._tables[table] = {record['token']: record for record in json.load(f)}
+
+    def get(self, table_name, token):
+        return self._tables[table_name][token]
+
+
+class _MiniPredictHelper(object):
+    """PredictHelper stand-in exposing what this dataset uses: `data` and map lookup."""
+
+    def __init__(self, data):
+        self.data = data
+
+    def get_map_name_from_sample_token(self, sample_token):
+        sample = self.data.get('sample', sample_token)
+        scene = self.data.get('scene', sample['scene_token'])
+        return self.data.get('log', scene['log_token'])['location']
 
 
 def load_all_maps(helper: PredictHelper, verbose: bool = False) -> Dict[str, NuScenesMap]:
