@@ -1,0 +1,32 @@
+{
+  "python.defaultInterpreterPath": "/home/cernanskyr/.conda/envs/vip/bin/python",
+  "python.condaPath": "/opt/conda/condabin/conda",
+  "python-envs.defaultEnvManager": "ms-python.python:conda",
+  "python-envs.workspaceSearchPaths": [],
+  "files.watcherExclude": {
+    "LiViP3D/**": true,
+    "data/nuscenes/**": true,
+    "work_dirs/**": true,
+    "trash/**": true,
+    "runs/**": true,
+    "ckpt_init/**": true
+  },
+  "search.exclude": {
+    "LiViP3D": true,
+    "data/nuscenes": true,
+    "work_dirs": true,
+    "trash": true,
+    "runs": true
+  },
+  "files.exclude": {
+    "LiViP3D": true
+  },
+  "python-envs.defaultPackageManager": "ms-python.python:conda",
+  "python.analysis.exclude": [
+    "**/data/nuscenes/**",
+    "**/work_dirs/**",
+    "**/trash/**",
+    "**/runs/**",
+    "**/ckpt_init/**"
+  ]
+}

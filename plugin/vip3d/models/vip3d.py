@@ -189,6 +189,7 @@ class ViP3D(MVXTwoStageDetector):
                  use_img_guided=False,
                  use_smca=False,
                  ):
+
         # Thread pc_range down into the decoder's nested config, once, before
         # super().__init__() builds pts_bbox_head from this dict.
         if use_lidar and pts_bbox_head is not None:
