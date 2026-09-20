@@ -133,6 +133,14 @@ model = dict(
             alpha=0.25,
             loss_weight=2.0),
         loss_bbox=dict(type='L1Loss', loss_weight=0.25),
+        # BEV heatmap supervision for query initialisation. alpha/gamma match
+        # CenterPoint; loss_weight=1.0 reproduces the previous hard-coded
+        # behaviour, where this term was ~a third of the total loss.
+        loss_heatmap=dict(
+            type='GaussianFocalLoss',
+            alpha=2.0,
+            gamma=4.0,
+            loss_weight=1.0),
     ),
     img_neck=dict(
         type='FPN',
