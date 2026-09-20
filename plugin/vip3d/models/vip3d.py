@@ -149,46 +149,46 @@ class ViP3D(MVXTwoStageDetector):
                 lidar_bev_channels=256,
                 lidar_voxel_size=None,
                 lidar_out_size_factor=4,
-                heatmap_score_thresh=0.1,
+                heatmap_score_thresh=0.1, # not in the configs yet, but used in the code
+                debug=False,
+                bev_vis=True,
+                vis_interval=20,
+                use_img_guided=False,
+                use_smca=False,
                 # END NEW
-                 bbox_coder=None,
-                 qim_args=None,
-                 mem_cfg=None,
-                 radar_encoder=None,
-                 fix_feats=False,
-                 fix_lidar=False,
-                 score_thresh=None,
-                 filter_score_thresh=None,
-                 use_grid_mask=False,
-                 pts_voxel_layer=None,
-                 pts_voxel_encoder=None,
-                 pts_middle_encoder=None,
-                 pts_fusion_layer=None,
-                 img_backbone=None,
-                 pts_backbone=None,
-                 img_neck=None,
-                 pts_neck=None,
-                 loss_cfg=None,
-                 pts_bbox_head=None,
-                 img_roi_head=None,
-                 img_rpn_head=None,
-                 train_cfg=None,
-                 test_cfg=None,
-                 pretrained=None,
-                 do_pred=False,
-                 predictor=None,
-                 relative_pred=False,
-                 agents_layer_0=False,
-                 agents_layer_0_num=2,
-                 only_matched_query=False,
-                 add_branch=False,
-                 add_branch_2=False,
-                 debug=False,
-                 bev_vis=True,
-                 vis_interval=20,
-                 use_img_guided=False,
-                 use_smca=False,
-                 ):
+                bbox_coder=None,
+                qim_args=None,
+                mem_cfg=None,
+                radar_encoder=None,
+                fix_feats=False,
+                fix_lidar=False,
+                score_thresh=None,
+                filter_score_thresh=None,
+                use_grid_mask=False,
+                pts_voxel_layer=None,
+                pts_voxel_encoder=None,
+                pts_middle_encoder=None,
+                pts_fusion_layer=None,
+                img_backbone=None,
+                pts_backbone=None,
+                img_neck=None,
+                pts_neck=None,
+                loss_cfg=None,
+                pts_bbox_head=None,
+                img_roi_head=None,
+                img_rpn_head=None,
+                train_cfg=None,
+                test_cfg=None,
+                pretrained=None,
+                do_pred=False,
+                predictor=None,
+                relative_pred=False,
+                agents_layer_0=False,
+                agents_layer_0_num=2,
+                only_matched_query=False,
+                add_branch=False,
+                add_branch_2=False,
+                ):
 
         # Thread pc_range down into the decoder's nested config, once, before
         # super().__init__() builds pts_bbox_head from this dict.
@@ -579,7 +579,6 @@ class ViP3D(MVXTwoStageDetector):
             print(f'[verify] heatmap_head[0].weight.sum()={self.heatmap_head[0].weight.data.sum().item():.3f} (expected -2340.769)')
             print(f'[verify] hm_task0[-1].bias={self.hm_task0[-1].bias.data.tolist()} (expected [-0.375])')
 
-        #always run
         if True:
             # extract features - run all sensor backbones for the frame
             img_feats, radar_feats, pts_feats = self.extract_feat(
@@ -589,7 +588,7 @@ class ViP3D(MVXTwoStageDetector):
                 [track_instances.pred_boxes[:, 2:4],
                 track_instances.pred_boxes[:, 5:6]], dim=1)
 
-        # ── LiVip add: fill empty slots + heatmap loss 
+        # ── init livip add: fill empty slots + heatmap loss 
         if self.use_lidar and pts_feats is not None:
             bev_feat = pts_feats[0] if isinstance(pts_feats, (list, tuple)) else pts_feats
             shared   = self.heatmap_head(bev_feat)                      # [B, 64, H, W]

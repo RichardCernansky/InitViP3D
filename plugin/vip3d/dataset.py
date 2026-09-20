@@ -965,7 +965,7 @@ class NuScenesTrackDatasetRadar(Dataset):
         Returns:
             dict: Training data dict of the corresponding index.
         """
-        input_dict = self.get_data_info(index)
+        input_dict = self.get_data_info(index) # paths, metadata, and annotations for a single frame
         if input_dict is None:
             return None
         self.pre_pipeline(input_dict)

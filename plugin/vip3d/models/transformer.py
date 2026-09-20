@@ -6,26 +6,7 @@ from mmcv.runner.base_module import BaseModule
 from mmcv.cnn.bricks.registry import TRANSFORMER_LAYER_SEQUENCE
 from mmcv.cnn.bricks.transformer import TransformerLayerSequence
 from mmdet.models.utils.builder import TRANSFORMER
-
-
-def inverse_sigmoid(x, eps=1e-5):
-    """Inverse function of sigmoid.
-
-    Args:
-        x (Tensor): The tensor to do the
-            inverse.
-        eps (float): EPS avoid numerical
-            overflow. Defaults 1e-5.
-    Returns:
-        Tensor: The x has passed the inverse
-            function of sigmoid, has same
-            shape with input.
-    """
-    x = x.clamp(min=0, max=1)
-    x1 = x.clamp(min=eps)
-    x2 = (1 - x).clamp(min=eps)
-    return torch.log(x1 / x2)
-
+from plugin.vip3d.utils import inverse_sigmoid
 
 @TRANSFORMER.register_module()
 class Detr3DCamTransformerPlus(BaseModule):
@@ -133,7 +114,6 @@ class Detr3DCamTransformerPlus(BaseModule):
         inter_references_out = inter_references
         return inter_states, init_reference_out, inter_references_out
 
-
 @TRANSFORMER.register_module()
 class Detr3DCamTrackTransformer(BaseModule):
     """Implements the DeformableDETR transformer. 
@@ -240,8 +220,6 @@ class Detr3DCamTrackTransformer(BaseModule):
 
         return inter_states, inter_references, inter_box_sizes
 
-
-# livip add - 
 @TRANSFORMER_LAYER_SEQUENCE.register_module()
 class Detr3DCamTrackPlusTransformerDecoder(TransformerLayerSequence):
     """Implements the decoder in DETR transformer.
@@ -337,6 +315,8 @@ class Detr3DCamTrackPlusTransformerDecoder(TransformerLayerSequence):
 
         return output, reference_points, ref_size
 
+
+# livip add  
 @TRANSFORMER.register_module()
 class TransFusionTransformer(BaseModule):
     """2-layer TransFusion transformer: Layer0=LiDAR BEV, Layer1=SMCA camera."""
