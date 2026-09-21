@@ -200,7 +200,7 @@ class ClipMatcher(nn.Module):
         # [num_matched]
         mask = (target_obj_ids != -1)
 
-        # also exclude camera-invisible GT boxes from regression loss
+        # also exclude camera-invisible GT boxes from regression loss if they have the vis_mask attribute (if checking visibility in camera view is ON)
         if hasattr(gt_instances[0], 'vis_mask'):
             target_vis = torch.cat([gt_per_img.vis_mask[i] for gt_per_img, (_, i) in zip(gt_instances, indices)], dim=0)
             mask = mask & target_vis

@@ -755,6 +755,59 @@ class ViP3D(MVXTwoStageDetector):
         # ^ refresh REAL card's query for next frame + drop dead slots -> this carries to frame+1
         return out_track_instances
 
+    @staticmethod
+    def _gt_camera_visibility(boxes, lidar2img, img_h, img_w):
+        """Which GT boxes have their centre inside at least one camera image.
+
+        boxes:     [N, >=3] LiDAR-frame boxes, centre in the first 3 columns
+        lidar2img: [num_cam, 4, 4] this frame's projection matrices
+        Returns:   [N] bool
+        """
+        device = boxes.device
+        if len(boxes) == 0:
+            return torch.zeros(0, dtype=torch.bool, device=device)
+        centers = boxes[:, :3]
+        pts_h = torch.cat([centers, torch.ones(len(centers), 1, device=device)], dim=1)
+        l2i = torch.tensor(np.array(lidar2img), dtype=torch.float32, device=device)
+        pts_cam = torch.einsum('cij,nj->nci', l2i, pts_h)  # [N, num_cam, 4]
+        depth = pts_cam[..., 2]
+        u = pts_cam[..., 0] / depth.clamp(min=1e-5)
+        v = pts_cam[..., 1] / depth.clamp(min=1e-5)
+        visible = (depth > 0) & (u > 0) & (u < img_w) & (v > 0) & (v < img_h)
+        return visible.any(dim=1)
+
+    def _build_gt_instances(self, gt_bboxes_3d, gt_labels_3d, instance_inds,
+                            img, img_metas, device):
+        """One GT `Instances` per clip frame, as ClipMatcher expects them.
+
+        Boxes are put into the head's regression space (normalize_bbox) and
+        each gets a `vis_mask`. Invisible boxes stay in the list -- keeping the
+        matcher's GT count stable -- and loss_labels / loss_boxes zero them
+        out instead. Visibility is only computed for a partial camera rig
+        (< 6 cams, no 360° coverage); with 6 cams or LiDAR-only every box
+        counts as visible.
+        """
+        check_cam_vis = (img is not None) and (self.pts_bbox_head.num_cams < 6)
+
+        gt_instances_list = []
+        for i, frame_boxes in enumerate(gt_bboxes_3d[0]):
+            boxes = frame_boxes.tensor.to(device)
+            if check_cam_vis:
+                vis_mask = self._gt_camera_visibility(
+                    boxes, img_metas[0]['lidar2img'][i], img.shape[-2], img.shape[-1])
+            else:
+                vis_mask = torch.ones(len(boxes), dtype=torch.bool, device=device)
+
+            gt_instances = self._targets_to_instances(
+                normalize_bbox(boxes, self.pc_range), gt_labels_3d[0][i], instance_inds[0][i])
+            gt_instances.vis_mask = vis_mask
+            gt_instances_list.append(gt_instances)
+        #     print(f'[GT vis] frame {i}: {vis_mask.sum().item()}/{len(vis_mask)} visible')
+        # total = sum(len(g.vis_mask) for g in gt_instances_list)
+        # kept  = sum(g.vis_mask.sum().item() for g in gt_instances_list)
+        # print(f'[GT vis] clip total: {kept}/{total} visible ({100*kept//max(total,1)}%)')
+        return gt_instances_list
+
     def forward_train(self,
                       points=None,
                       img=None,
@@ -803,50 +856,12 @@ class ViP3D(MVXTwoStageDetector):
 
         bs = len(gt_bboxes_3d)          # batch size (always 1)
         num_frame = l2g_r_mat.size(0)   # T frames in this clip
-        _device = l2g_r_mat.device      # use lidar pose tensor as device ref — img may be None
-        # project GT to check camera visibility only when using a partial camera rig
-        # (< 6 cams → no 360° coverage); with 6 cams or lidar-only all objects are visible
-        check_cam_vis = (img is not None) and (self.pts_bbox_head.num_cams < 6)
-        if check_cam_vis:
-            img_h, img_w = img.shape[-2], img.shape[-1]
         track_instances = self._generate_empty_tracks()
 
-        # init gt instances!
-        # SUPERVISE VISIBLE GT INSTANCES
-        # Compute per-instance camera visibility once, store as vis_mask.
-        # All GT boxes stay in the count (keeps num_samples stable → stable loss
-        # normalisation), but loss_labels and loss_boxes will zero out invisible ones.
-        gt_instances_list = []
-        for i in range(num_frame):
-            gt_instances = Instances((1, 1))
-            boxes = gt_bboxes_3d[0][i].tensor.to(_device)
-
-            if check_cam_vis and len(boxes) > 0:
-                lidar2img_gt = img_metas[0]['lidar2img']  # list[T] of [num_cam, 4, 4]
-                centers = boxes[:, :3]
-                pts_h = torch.cat([centers, torch.ones(len(centers), 1, device=_device)], dim=1)
-                l2i = torch.tensor(np.array(lidar2img_gt[i]), dtype=torch.float32, device=_device)
-                pts_cam = torch.einsum('cij,nj->nci', l2i, pts_h)  # [N, num_cam, 4]
-                depth = pts_cam[..., 2]
-                u = pts_cam[..., 0] / depth.clamp(min=1e-5)
-                v = pts_cam[..., 1] / depth.clamp(min=1e-5)
-                visible = (depth > 0) & (u > 0) & (u < img_w) & (v > 0) & (v < img_h)
-                vis_mask = visible.any(dim=1)  # [N] True = visible in at least one camera
-            elif check_cam_vis:
-                vis_mask = torch.zeros(0, dtype=torch.bool, device=_device)
-            else:
-                vis_mask = torch.ones(len(boxes), dtype=torch.bool, device=_device)
-
-            boxes = normalize_bbox(boxes, self.pc_range)
-            gt_instances.boxes = boxes
-            gt_instances.labels = gt_labels_3d[0][i]
-            gt_instances.obj_ids = instance_inds[0][i]
-            gt_instances.vis_mask = vis_mask
-            gt_instances_list.append(gt_instances)
-        #     print(f'[GT vis] frame {i}: {vis_mask.sum().item()}/{len(vis_mask)} visible')
-        # total = sum(len(g.vis_mask) for g in gt_instances_list)
-        # kept  = sum(g.vis_mask.sum().item() for g in gt_instances_list)
-        # print(f'[GT vis] clip total: {kept}/{total} visible ({100*kept//max(total,1)}%)')
+        # device from the lidar pose tensor -- img may be None
+        gt_instances_list = self._build_gt_instances(
+            gt_bboxes_3d, gt_labels_3d, instance_inds, img, img_metas,
+            device=l2g_r_mat.device)
 
         # reset call at the start of each training sample
         self.criterion.initialize_for_single_clip(gt_instances_list)

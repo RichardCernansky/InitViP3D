@@ -760,10 +760,11 @@ class LiDARBEVDeformCrossAtten(BaseModule):
 
         # ── TensorBoard: BEV attention visualisation ─────────────────────────
         from . import bev_vis as _bv
-        _bv.visualize_lidar_bev_attn(
-            bev_feat, reference_points,
-            sample_xy,              # [B, N, P, 2] in [0,1]
-            attn_w.squeeze(-1))     # [B, N, P]
+        if _bv.ENABLED:  # = model.bev_vis in the config (set in ViP3D.__init__)
+            _bv.visualize_lidar_bev_attn(
+                bev_feat, reference_points,
+                sample_xy,              # [B, N, P, 2] in [0,1]
+                attn_w.squeeze(-1))     # [B, N, P]
         # ─────────────────────────────────────────────────────────────────────
 
         from . import bev_vis as _bv
