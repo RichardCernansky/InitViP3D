@@ -1,3 +1,7 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
 ckpt_init
 mmdetection3d
 work_dirs/

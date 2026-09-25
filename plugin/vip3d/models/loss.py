@@ -64,6 +64,16 @@ class ClipMatcher(nn.Module):
                      alpha=0.25,
                      loss_weight=2.0),
                  loss_bbox=dict(type='L1Loss', loss_weight=0.25),
+                 # CenterPoint's penalty-reduced focal loss on the BEV class
+                 # heatmap. alpha=2.0/gamma=4.0 reproduce the hand-rolled
+                 # version this replaced; loss_weight is the knob the heatmap
+                 # term never had -- it currently contributes ~a third of the
+                 # total loss for what is an auxiliary query-init signal.
+                 loss_heatmap=dict(
+                     type='GaussianFocalLoss',
+                     alpha=2.0,
+                     gamma=4.0,
+                     loss_weight=1.0),
                  ):
         """ Create the criterion.
         Parameters:
@@ -76,6 +86,7 @@ class ClipMatcher(nn.Module):
         self.matcher = build_assigner(assigner)
         self.loss_cls = build_loss(loss_cls)
         self.loss_bboxes = build_loss(loss_bbox)
+        self.loss_heatmap = build_loss(loss_heatmap)
         self.register_buffer('code_weights', torch.tensor(code_weights,
                                                           requires_grad=False))
 
@@ -189,7 +200,7 @@ class ClipMatcher(nn.Module):
         # [num_matched]
         mask = (target_obj_ids != -1)
 
-        # also exclude camera-invisible GT boxes from regression loss
+        # also exclude camera-invisible GT boxes from regression loss if they have the vis_mask attribute (if checking visibility in camera view is ON)
         if hasattr(gt_instances[0], 'vis_mask'):
             target_vis = torch.cat([gt_per_img.vis_mask[i] for gt_per_img, (_, i) in zip(gt_instances, indices)], dim=0)
             mask = mask & target_vis

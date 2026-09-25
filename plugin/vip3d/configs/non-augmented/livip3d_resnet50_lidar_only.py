@@ -119,6 +119,14 @@ model = dict(
             alpha=0.25,
             loss_weight=2.0),
         loss_bbox=dict(type='L1Loss', loss_weight=0.25),
+        # BEV heatmap supervision for query initialisation (CenterPoint
+        # alpha/gamma). loss_weight=1.0 is the weight this term had when
+        # it was hard-coded in ViP3D._heatmap_loss.
+        loss_heatmap=dict(
+            type='GaussianFocalLoss',
+            alpha=2.0,
+            gamma=4.0,
+            loss_weight=1.0),
     ),
     img_neck=dict(
         type='FPN',

@@ -20,7 +20,7 @@ from mmdet3d.core.bbox.coders import build_bbox_coder
 from ...mmdet3d_plugin.core.bbox.util import normalize_bbox, denormalize_bbox
 from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
 from ...mmdet3d_plugin.models.utils.grid_mask import GridMask
-from .attention_dert3d import inverse_sigmoid
+from .attention_dert3d import inverse_sigmoid, ImageGuidedBEVProjection
 from . import predictor_lib
 from .memory_bank import build_memory_bank
 from .qim import build_qim
@@ -82,60 +82,6 @@ class RuntimeTrackerBase(object):
             elif track_instances.obj_idxes[i] >= 0 and track_instances.scores[i] >= self.filter_score_thresh:
                 # keep class unchanged!
                 track_instances.pred_logits[i] = old_class_scores[i]
-
-
-class ImageGuidedBEVProjection(nn.Module):
-    """
-    Projects image features onto the BEV plane via per-camera cross-attention.
-    Implements Figure 4 of TransFusion (Section 3.6):
-      1. Collapse image height axis via max → column features [B, W, C] per camera
-      2. Per-camera MHA: Q=BEV locations, K/V=camera columns → F_LC_i per camera
-      3. Average F_LC_i across cameras → F_LC [B, C_bev, H, W]
-    """
-    def __init__(self, bev_channels, img_channels=256, embed_dims=256, num_heads=8, num_cams=6):
-        super().__init__()
-        self.num_cams = num_cams
-        self.bev_proj = nn.Linear(bev_channels, embed_dims)
-        self.img_proj = nn.Linear(img_channels, embed_dims)
-        self.cross_attns = nn.ModuleList([
-            nn.MultiheadAttention(embed_dims, num_heads, batch_first=True)
-            for _ in range(num_cams)
-        ])
-        self.out_proj = nn.Linear(embed_dims, bev_channels)
-        self.norm = nn.LayerNorm(embed_dims)
-
-    def forward(self, bev_feat, img_feats):
-        """
-        Args:
-            bev_feat:  [B, C_bev, H, W]
-            img_feats: list of [B, N_cams, C_img, H_img, W_img]
-        Returns:
-            F_LC: [B, C_bev, H, W]
-        """
-        B, C_bev, H, W = bev_feat.shape
-        img = img_feats[0]  # highest-res FPN level
-        _, N_cams, C_img, H_img, W_img = img.shape
-
-        # Collapse height axis via max → [B, N_cams, W_img, C_img] then project
-        img_cols = img.max(dim=3).values           # [B, N_cams, C_img, W_img]
-        img_cols = img_cols.permute(0, 1, 3, 2)    # [B, N_cams, W_img, C_img]
-        img_cols = self.img_proj(img_cols)          # [B, N_cams, W_img, D]
-
-        # BEV as queries → [B, H*W, D]
-        bev_q = self.bev_proj(bev_feat.permute(0, 2, 3, 1).reshape(B, H * W, C_bev))
-
-        # Per-camera attention, average across cameras
-        n = min(N_cams, self.num_cams)
-        cam_outs = []
-        for i in range(n):
-            kv_i = img_cols[:, i]                          # [B, W_img, D]
-            attn_i, _ = self.cross_attns[i](bev_q, kv_i, kv_i)
-            cam_outs.append(attn_i)
-        attn_avg = torch.stack(cam_outs, dim=0).mean(dim=0)  # [B, H*W, D]
-        attn_avg = self.norm(bev_q + attn_avg)
-
-        F_LC = self.out_proj(attn_avg).reshape(B, H, W, C_bev).permute(0, 3, 1, 2)
-        return F_LC
 
 
 @DETECTORS.register_module()
@@ -211,6 +157,9 @@ class ViP3D(MVXTwoStageDetector):
         _bv_mod.ENABLED      = bev_vis
         _bv_mod.DEBUG_PRINTS = debug
         _bv_mod.VIS_INTERVAL = vis_interval
+        # Also kept on self so the call sites can skip the visualiser outright
+        # instead of relying on the module-global guard inside each function.
+        self.bev_vis = bev_vis
 
         self.grid_mask = GridMask(True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7)
         self.use_grid_mask = use_grid_mask
@@ -255,8 +204,6 @@ class ViP3D(MVXTwoStageDetector):
             )
             # Per-task heatmap heads loaded directly from CenterPoint — no merging, no adaptation.
             # task layout: 0=car(1), 1=truck+cveh(2), 2=bus+trailer(2), 4=moto+bike(2), 5=ped+cone(2)
-            # Forward slices: car=t0[:,0], truck=t1[:,0], bus=t2[:,0], trailer=t2[:,1],
-            #                 moto=t4[:,0], bike=t4[:,1], ped=t5[:,0]
             def _task_head(n_cls):
                 return nn.Sequential(
                     nn.Conv2d(64, 64, 3, padding=1),
@@ -269,6 +216,19 @@ class ViP3D(MVXTwoStageDetector):
             self.hm_task2 = _task_head(2)   # bus, trailer
             self.hm_task4 = _task_head(2)   # motorcycle, bicycle
             self.hm_task5 = _task_head(2)   # pedestrian, traffic_cone
+            # Which (head, channel) supplies each of this model's 7 classes, in
+            # class order. _assemble_heatmap drives both the LiDAR heads above
+            # and the img_-prefixed ones below off this one table; the classes
+            # this model drops (cveh, traffic_cone) are simply never listed.
+            self._hm_layout = (
+                ('hm_task0', 0),   # car
+                ('hm_task1', 0),   # truck
+                ('hm_task2', 0),   # bus
+                ('hm_task2', 1),   # trailer
+                ('hm_task4', 0),   # motorcycle
+                ('hm_task4', 1),   # bicycle
+                ('hm_task5', 0),   # pedestrian
+            )
             # Projects BEV channels → embed_dims for query content vector
             self.lidar_bev_proj = nn.Linear(lidar_bev_channels, embed_dims)
 
@@ -554,6 +514,106 @@ class ViP3D(MVXTwoStageDetector):
                 self.predictor.decoder.do_eval = True
             return self.forward_test(**kwargs)
 
+    def _assemble_heatmap(self, shared, prefix=''):
+        """Regroup CenterPoint's task heads into this model's class order.
+
+        `prefix=''` runs the LiDAR heads, `prefix='img_'` the image-guided
+        ones -- they share a layout, only the modules differ. Each head is
+        evaluated once and then sliced, since several classes come from the
+        same head (bus and trailer both live in hm_task2).
+
+        Returns: [B, 7, H, W], pre-sigmoid logits in class order.
+        """
+        run = {}
+        channels = []
+        for name, c in self._hm_layout:
+            if name not in run:
+                run[name] = getattr(self, prefix + name)(shared)
+            channels.append(run[name][:, c:c + 1])
+        return torch.cat(channels, dim=1)
+
+    def _compute_heatmap(self, bev_feat, img_feats):
+        """BEV features -> (class heatmap, features the queries are read from).
+
+        With use_img_guided the LiDAR and image heatmaps are averaged and the
+        queries are read from the image-guided projection instead of the raw
+        BEV, which is why both come back together.
+        """
+        heatmap = self._assemble_heatmap(self.heatmap_head(bev_feat))
+        feat_for_queries = bev_feat
+
+        if self.use_img_guided and img_feats is not None:
+            F_LC = self.img_bev_proj(bev_feat, img_feats)
+            img_heatmap = self._assemble_heatmap(self.img_hm_head(F_LC), prefix='img_')
+            heatmap = (heatmap + img_heatmap) * 0.5
+            feat_for_queries = F_LC
+
+        return heatmap, feat_for_queries
+
+    def _fill_empty_slots(self, track_instances, heatmap, feat_for_queries, img_metas):
+        """Seed unassigned query slots from the strongest heatmap peaks.
+
+        Every empty slot gets a position so ref_pts are spread across the BEV
+        rather than piled at the vehicle origin; track birth stays gated by
+        TrackBase.update's score_thresh, so weak peaks still cannot start a
+        track. Returns the indices that were filled (for the visualiser).
+        """
+        empty_mask = track_instances.obj_idxes < 0
+        num_empty = int(empty_mask.sum())
+        if num_empty == 0:
+            return None
+
+        active_ref = track_instances.ref_pts[track_instances.obj_idxes >= 0] \
+            if (track_instances.obj_idxes >= 0).any() else None
+        new_ref_pts, new_queries, _ = self.select_topk_from_heatmap(
+            heatmap, feat_for_queries, num_select=num_empty,
+            active_ref_pts=active_ref, img_metas=img_metas)
+
+        # Take only as many slots as peaks came back -- select_topk_from_heatmap
+        # can return fewer than requested, and indexing by the full mask would
+        # raise on the size mismatch.
+        n_fill = new_ref_pts.shape[0]
+        if n_fill == 0:
+            return None
+        filled = empty_mask.nonzero(as_tuple=False)[:, 0][:n_fill]
+
+        track_instances.ref_pts = track_instances.ref_pts.clone()
+        track_instances.query = track_instances.query.clone()
+        track_instances.ref_pts[filled] = new_ref_pts
+        track_instances.query[filled] = new_queries
+        return filled
+
+    def _heatmap_loss(self, heatmap, gt_bboxes_3d, gt_labels_3d, device):
+        """Gaussian focal loss on the class heatmap.
+
+        The loss itself is `loss_cfg.loss_heatmap` (see ClipMatcher), so its
+        type and weight come from the config rather than being hard-coded
+        here; this method only builds the GT map and the normaliser.
+
+        Returns (loss, gt_heatmap); the GT map is handed back because the
+        visualiser wants it and it is not worth rebuilding.
+        """
+        H_bev, W_bev = heatmap.shape[2], heatmap.shape[3]
+        boxes_t = gt_bboxes_3d[0].tensor.to(device) \
+            if hasattr(gt_bboxes_3d[0], 'tensor') else gt_bboxes_3d[0]
+        labels_t = gt_labels_3d[0].to(device)
+        boxes_norm = normalize_bbox(boxes_t, self.pc_range)
+        gt_hm = self._generate_gt_heatmap(boxes_norm, labels_t, H_bev, W_bev, device)   # [K, H, W]
+        pred_hm = heatmap[0].sigmoid()
+
+        # don't apply visibillity mask - heat map loss is only applied to visible objects
+        # vis_mask = self._build_camera_visibility_mask(
+        #     H_bev, W_bev, img_metas, device)
+        # gt_hm = gt_hm * vis_mask.unsqueeze(0).float()
+
+        # Only exact peak cells count as positive; normalise by how many there
+        # are, so the term is "average penalty per object" rather than growing
+        # with the 512x512x7 grid. GaussianFocalLoss already down-weights cells
+        # by (1 - gt)^gamma, which is 0 at the peaks, so no explicit negative
+        # mask is needed.
+        num_pos = gt_hm.eq(1).float().sum().clamp(min=1)
+        return self.criterion.loss_heatmap(pred_hm, gt_hm, avg_factor=num_pos), gt_hm
+
     @auto_fp16(apply_to=('img', 'radar', 'points'))
     def _forward_single(self, points, img, radar, img_metas, track_instances,
                         l2g_r1=None, l2g_t1=None, l2g_r2=None, l2g_t2=None,
@@ -588,92 +648,31 @@ class ViP3D(MVXTwoStageDetector):
                 [track_instances.pred_boxes[:, 2:4],
                 track_instances.pred_boxes[:, 5:6]], dim=1)
 
-        # ── init livip add: fill empty slots + heatmap loss 
+        # ── init livip add: fill empty slots + heatmap loss
         if self.use_lidar and pts_feats is not None:
             bev_feat = pts_feats[0] if isinstance(pts_feats, (list, tuple)) else pts_feats
-            shared   = self.heatmap_head(bev_feat)                      # [B, 64, H, W]
-            t2 = self.hm_task2(shared); t4 = self.hm_task4(shared); t5 = self.hm_task5(shared)
-            heatmap  = torch.cat([                                      # [B, 7, H, W]
-                self.hm_task0(shared),          # car
-                self.hm_task1(shared)[:, :1],   # truck
-                t2[:, :1],                       # bus
-                t2[:, 1:],                       # trailer
-                t4[:, :1],                       # motorcycle
-                t4[:, 1:],                       # bicycle
-                t5[:, :1],                       # pedestrian
-            ], dim=1)
-
-            feat_for_queries = bev_feat
-            if self.use_img_guided and img_feats is not None:
-                F_LC = self.img_bev_proj(bev_feat, img_feats)
-                img_shared = self.img_hm_head(F_LC)
-                _it2 = self.img_hm_task2(img_shared)
-                _it4 = self.img_hm_task4(img_shared)
-                _it5 = self.img_hm_task5(img_shared)
-                img_heatmap = torch.cat([
-                    self.img_hm_task0(img_shared),
-                    self.img_hm_task1(img_shared)[:, :1],
-                    _it2[:, :1], _it2[:, 1:],
-                    _it4[:, :1], _it4[:, 1:],
-                    _it5[:, :1],
-                ], dim=1)
-                heatmap = (heatmap + img_heatmap) * 0.5
-                feat_for_queries = F_LC
+            heatmap, feat_for_queries = self._compute_heatmap(bev_feat, img_feats)   # [B, 7, H, W]
 
             # 1. fill so far empty slots
-            empty_mask = track_instances.obj_idxes < 0
-            num_empty  = int(empty_mask.sum())
-            if num_empty > 0:
-                active_ref = track_instances.ref_pts[track_instances.obj_idxes >= 0] \
-                            if (track_instances.obj_idxes >= 0).any() else None
-                new_ref_pts, new_queries, _ = self.select_topk_from_heatmap(
-                    heatmap, feat_for_queries, num_select=num_empty, active_ref_pts=active_ref, img_metas=img_metas)
+            filled = self._fill_empty_slots(
+                track_instances, heatmap, feat_for_queries, img_metas)
 
-                track_instances.ref_pts = track_instances.ref_pts.clone()
-                track_instances.query   = track_instances.query.clone()
-                track_instances.ref_pts[empty_mask] = new_ref_pts
-                track_instances.query[empty_mask]   = new_queries
-
+            if self.bev_vis and filled is not None:
                 # debug vis - store top-20 for SMCA visualisation
                 from .bev_vis import set_top_queries as _set_tq
-                empty_indices = empty_mask.nonzero(as_tuple=False)[:, 0]
-                top20_idx = empty_indices[:20]
+                top20_idx = filled[:20]
                 _set_tq(track_instances.ref_pts[top20_idx], top20_idx)
 
             # 2. heatmap supervision — independent of whether any slots were filled
             gt_hm_vis = None
             if self.training and gt_bboxes_3d is not None and gt_labels_3d is not None:
-                H_bev, W_bev = heatmap.shape[2], heatmap.shape[3]
-                boxes_t    = gt_bboxes_3d[0].tensor.to(bev_feat.device) \
-                            if hasattr(gt_bboxes_3d[0], 'tensor') else gt_bboxes_3d[0]
-                labels_t   = gt_labels_3d[0].to(bev_feat.device)
-                boxes_norm = normalize_bbox(boxes_t, self.pc_range)
-                gt_hm      = self._generate_gt_heatmap(
-                    boxes_norm, labels_t, H_bev, W_bev, bev_feat.device)   # [K, H, W]
-                gt_hm_vis  = gt_hm
-                pred_hm    = heatmap[0].sigmoid()
-
-                # don't apply visibillity mask - heat map loss is only applied to visible objects
-                # vis_mask = self._build_camera_visibility_mask(
-                #     H_bev, W_bev, img_metas, bev_feat.device)
-                # gt_hm = gt_hm * vis_mask.unsqueeze(0).float()
-
-                # only exact peak cells get 1
-                pos_mask    = gt_hm.eq(1).float()
-                # the closer to exact peak -> weight close to 0
-                neg_weights = torch.pow(1 - gt_hm, 4)
-
-                # focal loss with alpha=0.25, gamma=2.0
-                pos_loss = torch.log(pred_hm.clamp(min=1e-6)) * torch.pow(1 - pred_hm, 2) * pos_mask
-                neg_loss = torch.log((1 - pred_hm).clamp(min=1e-6)) * torch.pow(pred_hm, 2) \
-                        * neg_weights * gt_hm.lt(1).float()
-                num_pos  = pos_mask.sum().clamp(min=1)
-                # normalize by the number of positive cells (exact peaks)
-                heatmap_loss = -(pos_loss.sum() + neg_loss.sum()) / num_pos
+                heatmap_loss, gt_hm_vis = self._heatmap_loss(
+                    heatmap, gt_bboxes_3d, gt_labels_3d, bev_feat.device)
                 frame_idx = self.criterion._current_frame_idx
                 self.criterion.losses_dict[f'frame_{frame_idx}_heatmap_loss'] = heatmap_loss
 
-            visualize_bev(bev_feat, heatmap, gt_hm_vis)
+            if self.bev_vis:
+                visualize_bev(bev_feat, heatmap, gt_hm_vis)
         # LiVip add end
 
         # always runs regardless of use_lidar
@@ -688,7 +687,7 @@ class ViP3D(MVXTwoStageDetector):
             cur_ego_r=l2g_r1, cur_ego_t=l2g_t1, time_delta=time_delta)
 
         # SMCA attention visualisation (runs after pts_bbox_head so attn is collected)
-        if self.use_lidar and pts_feats is not None:
+        if self.bev_vis and self.use_lidar and pts_feats is not None:
             from .bev_vis import visualize_train_smca as _vis_smca, visualize_smca_gauss as _vis_gauss
             _vis_smca(heatmap, img)
             _vis_gauss(img)
@@ -756,6 +755,59 @@ class ViP3D(MVXTwoStageDetector):
         # ^ refresh REAL card's query for next frame + drop dead slots -> this carries to frame+1
         return out_track_instances
 
+    @staticmethod
+    def _gt_camera_visibility(boxes, lidar2img, img_h, img_w):
+        """Which GT boxes have their centre inside at least one camera image.
+
+        boxes:     [N, >=3] LiDAR-frame boxes, centre in the first 3 columns
+        lidar2img: [num_cam, 4, 4] this frame's projection matrices
+        Returns:   [N] bool
+        """
+        device = boxes.device
+        if len(boxes) == 0:
+            return torch.zeros(0, dtype=torch.bool, device=device)
+        centers = boxes[:, :3]
+        pts_h = torch.cat([centers, torch.ones(len(centers), 1, device=device)], dim=1)
+        l2i = torch.tensor(np.array(lidar2img), dtype=torch.float32, device=device)
+        pts_cam = torch.einsum('cij,nj->nci', l2i, pts_h)  # [N, num_cam, 4]
+        depth = pts_cam[..., 2]
+        u = pts_cam[..., 0] / depth.clamp(min=1e-5)
+        v = pts_cam[..., 1] / depth.clamp(min=1e-5)
+        visible = (depth > 0) & (u > 0) & (u < img_w) & (v > 0) & (v < img_h)
+        return visible.any(dim=1)
+
+    def _build_gt_instances(self, gt_bboxes_3d, gt_labels_3d, instance_inds,
+                            img, img_metas, device):
+        """One GT `Instances` per clip frame, as ClipMatcher expects them.
+
+        Boxes are put into the head's regression space (normalize_bbox) and
+        each gets a `vis_mask`. Invisible boxes stay in the list -- keeping the
+        matcher's GT count stable -- and loss_labels / loss_boxes zero them
+        out instead. Visibility is only computed for a partial camera rig
+        (< 6 cams, no 360° coverage); with 6 cams or LiDAR-only every box
+        counts as visible.
+        """
+        check_cam_vis = (img is not None) and (self.pts_bbox_head.num_cams < 6)
+
+        gt_instances_list = []
+        for i, frame_boxes in enumerate(gt_bboxes_3d[0]):
+            boxes = frame_boxes.tensor.to(device)
+            if check_cam_vis:
+                vis_mask = self._gt_camera_visibility(
+                    boxes, img_metas[0]['lidar2img'][i], img.shape[-2], img.shape[-1])
+            else:
+                vis_mask = torch.ones(len(boxes), dtype=torch.bool, device=device)
+
+            gt_instances = self._targets_to_instances(
+                normalize_bbox(boxes, self.pc_range), gt_labels_3d[0][i], instance_inds[0][i])
+            gt_instances.vis_mask = vis_mask
+            gt_instances_list.append(gt_instances)
+        #     print(f'[GT vis] frame {i}: {vis_mask.sum().item()}/{len(vis_mask)} visible')
+        # total = sum(len(g.vis_mask) for g in gt_instances_list)
+        # kept  = sum(g.vis_mask.sum().item() for g in gt_instances_list)
+        # print(f'[GT vis] clip total: {kept}/{total} visible ({100*kept//max(total,1)}%)')
+        return gt_instances_list
+
     def forward_train(self,
                       points=None,
                       img=None,
@@ -804,50 +856,12 @@ class ViP3D(MVXTwoStageDetector):
 
         bs = len(gt_bboxes_3d)          # batch size (always 1)
         num_frame = l2g_r_mat.size(0)   # T frames in this clip
-        _device = l2g_r_mat.device      # use lidar pose tensor as device ref — img may be None
-        # project GT to check camera visibility only when using a partial camera rig
-        # (< 6 cams → no 360° coverage); with 6 cams or lidar-only all objects are visible
-        check_cam_vis = (img is not None) and (self.pts_bbox_head.num_cams < 6)
-        if check_cam_vis:
-            img_h, img_w = img.shape[-2], img.shape[-1]
         track_instances = self._generate_empty_tracks()
 
-        # init gt instances!
-        # SUPERVISE VISIBLE GT INSTANCES
-        # Compute per-instance camera visibility once, store as vis_mask.
-        # All GT boxes stay in the count (keeps num_samples stable → stable loss
-        # normalisation), but loss_labels and loss_boxes will zero out invisible ones.
-        gt_instances_list = []
-        for i in range(num_frame):
-            gt_instances = Instances((1, 1))
-            boxes = gt_bboxes_3d[0][i].tensor.to(_device)
-
-            if check_cam_vis and len(boxes) > 0:
-                lidar2img_gt = img_metas[0]['lidar2img']  # list[T] of [num_cam, 4, 4]
-                centers = boxes[:, :3]
-                pts_h = torch.cat([centers, torch.ones(len(centers), 1, device=_device)], dim=1)
-                l2i = torch.tensor(np.array(lidar2img_gt[i]), dtype=torch.float32, device=_device)
-                pts_cam = torch.einsum('cij,nj->nci', l2i, pts_h)  # [N, num_cam, 4]
-                depth = pts_cam[..., 2]
-                u = pts_cam[..., 0] / depth.clamp(min=1e-5)
-                v = pts_cam[..., 1] / depth.clamp(min=1e-5)
-                visible = (depth > 0) & (u > 0) & (u < img_w) & (v > 0) & (v < img_h)
-                vis_mask = visible.any(dim=1)  # [N] True = visible in at least one camera
-            elif check_cam_vis:
-                vis_mask = torch.zeros(0, dtype=torch.bool, device=_device)
-            else:
-                vis_mask = torch.ones(len(boxes), dtype=torch.bool, device=_device)
-
-            boxes = normalize_bbox(boxes, self.pc_range)
-            gt_instances.boxes = boxes
-            gt_instances.labels = gt_labels_3d[0][i]
-            gt_instances.obj_ids = instance_inds[0][i]
-            gt_instances.vis_mask = vis_mask
-            gt_instances_list.append(gt_instances)
-        #     print(f'[GT vis] frame {i}: {vis_mask.sum().item()}/{len(vis_mask)} visible')
-        # total = sum(len(g.vis_mask) for g in gt_instances_list)
-        # kept  = sum(g.vis_mask.sum().item() for g in gt_instances_list)
-        # print(f'[GT vis] clip total: {kept}/{total} visible ({100*kept//max(total,1)}%)')
+        # device from the lidar pose tensor -- img may be None
+        gt_instances_list = self._build_gt_instances(
+            gt_bboxes_3d, gt_labels_3d, instance_inds, img, img_metas,
+            device=l2g_r_mat.device)
 
         # reset call at the start of each training sample
         self.criterion.initialize_for_single_clip(gt_instances_list)
@@ -1059,52 +1073,10 @@ class ViP3D(MVXTwoStageDetector):
             bev_feat = None
             if self.use_lidar and pts_feats is not None:
                 bev_feat = pts_feats[0] if isinstance(pts_feats, (list, tuple)) else pts_feats
-                shared   = self.heatmap_head(bev_feat)
-                _t2 = self.hm_task2(shared); _t4 = self.hm_task4(shared); _t5 = self.hm_task5(shared)
-                heatmap  = torch.cat([
-                    self.hm_task0(shared),
-                    self.hm_task1(shared)[:, :1],
-                    _t2[:, :1], _t2[:, 1:],
-                    _t4[:, :1], _t4[:, 1:],
-                    _t5[:, :1],
-                ], dim=1)
+                heatmap, feat_for_queries = self._compute_heatmap(bev_feat, img_feats)
 
-                feat_for_queries = bev_feat
-                if self.use_img_guided and img_feats is not None:
-                    F_LC = self.img_bev_proj(bev_feat, img_feats)
-                    img_shared = self.img_hm_head(F_LC)
-                    _it2 = self.img_hm_task2(img_shared)
-                    _it4 = self.img_hm_task4(img_shared)
-                    _it5 = self.img_hm_task5(img_shared)
-                    img_heatmap = torch.cat([
-                        self.img_hm_task0(img_shared),
-                        self.img_hm_task1(img_shared)[:, :1],
-                        _it2[:, :1], _it2[:, 1:],
-                        _it4[:, :1], _it4[:, 1:],
-                        _it5[:, :1],
-                    ], dim=1)
-                    heatmap = (heatmap + img_heatmap) * 0.5
-                    feat_for_queries = F_LC
-
-                empty_mask = track_instances.obj_idxes < 0
-                num_empty  = int(empty_mask.sum())
-                if num_empty > 0:
-                    active_ref = track_instances.ref_pts[track_instances.obj_idxes >= 0] \
-                                if (track_instances.obj_idxes >= 0).any() else None
-                    new_ref_pts, new_queries, hm_scores = self.select_topk_from_heatmap(
-                        heatmap, feat_for_queries, num_select=num_empty, active_ref_pts=active_ref, img_metas=img_metas)
-
-                    # Always fill all empty slots with heatmap positions so ref_pts are
-                    # spread across the BEV rather than sitting at zero (vehicle origin).
-                    # Track birth is still gated by TrackBase.update's score_thresh=0.4,
-                    # so low-confidence peaks won't birth tracks even though they get positions.
-                    n_fill = new_ref_pts.shape[0]
-                    if n_fill > 0:
-                        empty_indices = empty_mask.nonzero(as_tuple=False)[:, 0][:n_fill]
-                        track_instances.ref_pts = track_instances.ref_pts.clone()
-                        track_instances.query   = track_instances.query.clone()
-                        track_instances.ref_pts[empty_indices] = new_ref_pts
-                        track_instances.query[empty_indices]   = new_queries
+                self._fill_empty_slots(
+                    track_instances, heatmap, feat_for_queries, img_metas)
 
             # ── end LiViP3D ──────────────────────────────────────────────────────────
 
