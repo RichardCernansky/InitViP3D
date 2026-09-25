@@ -1,9 +1,16 @@
+25. 9. 2026
+Experiments To Perform
+1. non-augmented lidar-only -> smca on beast
+2. augmented lidar+image pretrain -> smca on beast
+3. all on Perun
+- check l0, l1 architectures in detail
+
 //add visualizations for top-k query in both BEV and camera to see the correctness of gaussian blobs
 Stage 1 (use_camera=False, fix_feats=True)
 Stage 2 — when ready, flip back
 test <6 cameras
 
-
+stvrtok o 17 1.10.
 REFACTOR Sunday, 20.9. 2026
 
 

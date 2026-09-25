@@ -351,5 +351,5 @@ evaluation = dict(interval=6)
 runner = dict(type='EpochBasedRunner', max_epochs=6)
 
 find_unused_parameters = True
-load_from = 'work_dirs/augmented/s1-lidar_only/epoch_20.pth'
+load_from = 'work_dirs/augmented/s1-lidar-only-paste-4-pred/epoch_20.pth'
 # fp16 = dict(loss_scale='dynamic')
