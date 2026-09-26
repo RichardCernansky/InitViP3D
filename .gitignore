@@ -11,3 +11,5 @@ data
 runs
 prof_trace
 trash
+
+.claude/
