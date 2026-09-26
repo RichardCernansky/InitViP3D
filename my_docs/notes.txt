@@ -1,3 +1,11 @@
+MIGRATION 26.9. 2026
+- migrate codebase
+- migrate work_dirs
+- migrate ckpt_init
+- put claude.md on cluster
+- set up pylance settings
+- deal with the dependencies
+
 25. 9. 2026
 Experiments To Perform
 1. non-augmented lidar-only -> smca on beast
@@ -6,6 +14,8 @@ Experiments To Perform
 - check l0, l1 architectures in detail
 - update the configs with the new loss
 - lanes are augmented as well
+- check for initialization of poinPillars backbone what is wrong
+
 
 //add visualizations for top-k query in both BEV and camera to see the correctness of gaussian blobs
 Stage 1 (use_camera=False, fix_feats=True)
@@ -14,7 +24,6 @@ test <6 cameras
 
 stvrtok o 17 1.10.
 REFACTOR Sunday, 20.9. 2026
-
 
 
 OTAZKY KU 26.5. 2026
