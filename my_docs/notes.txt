@@ -4,6 +4,7 @@ MIGRATION 26.9. 2026
 - migrate ckpt_init
 - put claude.md on cluster
 - set up pylance settings
+- set up mini
 - deal with the dependencies
 
 25. 9. 2026

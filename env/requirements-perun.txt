@@ -1,0 +1,39 @@
+# Binary (wheel-only) dependencies for the Perun H200 env. Installed by env/build_env.sbatch.
+# mmcv-full, mmdet, mmsegmentation, mmdet3d, nuscenes-devkit and lyft_dataset_sdk are
+# installed separately by the build script (source builds / --no-deps).
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+torch==2.1.2+cu118              # first torch/CUDA combo with sm_90 (H200) kernels that mmcv 1.x still supports
+torchvision==0.16.2+cu118
+numpy==1.23.5                   # <1.24: code uses np.long / np.bool / np.int
+numba==0.56.4                   # 0.48 (original pin) has no wheels for numpy 1.23
+setuptools==59.8.0              # numba 0.56 requires setuptools<60
+ninja
+wheel
+yapf==0.40.1                    # yapf>=0.40.2 breaks mmcv 1.x Config
+addict
+packaging
+pyyaml
+Pillow==9.5.0
+opencv-python-headless==4.5.5.62
+matplotlib==3.5.3               # nuscenes-devkit needs <3.6
+scipy==1.10.1
+scikit-learn==1.3.2
+scikit-image==0.19.3
+shapely==1.8.5.post1            # nuscenes-devkit needs <2.0
+pyquaternion
+descartes
+pandas==1.3.5
+motmetrics==1.1.3
+networkx==2.2
+trimesh==2.35.39
+plyfile
+tensorboard==2.14.0
+pycocotools
+terminaltables
+prettytable
+parameterized
+cachetools
+fire
+plotly
+tqdm
