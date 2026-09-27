@@ -615,24 +615,25 @@ class ViP3D(MVXTwoStageDetector):
         return self.criterion.loss_heatmap(pred_hm, gt_hm, avg_factor=num_pos), gt_hm
 
     @auto_fp16(apply_to=('img', 'radar', 'points'))
-    def _forward_single(self, points, img, radar, img_metas, track_instances,
+    def _forward_single(self, feats, img, img_metas, track_instances,
                         l2g_r1=None, l2g_t1=None, l2g_r2=None, l2g_t2=None,
                         time_delta=None, is_last_frame=False,
                         gt_bboxes_3d=None,
                         gt_labels_3d=None,
                         mapping=None,
+                        vis=False,
                         ):
         '''
-        Warnning: Only Support BS=1
-        img: shape [B, num_cam, 3, H, W]
+        One frame of one clip; every input is a batch of one.
+        feats: (img_feats, radar_feats, pts_feats) for this frame, as
+            extract_feat returns them, sliced to this sample.
+        img: shape [num_cam, 3, H, W], only read by the visualiser.
+        vis: run the BEV visualiser for this frame.
 
         if l2g_r2 is None or l2g_t2 is None:
             no need to call velo update
         '''
         # l2g_r2 is rotation matrix of next frame
-
-        if img is not None:  # lidar-only: img is None, B/num_cam/H/W unused
-            B, num_cam, _, H, W = img.shape
 
         if self.use_lidar and not hasattr(self, '_heatmap_verified'):
             self._heatmap_verified = True
@@ -640,9 +641,8 @@ class ViP3D(MVXTwoStageDetector):
             print(f'[verify] hm_task0[-1].bias={self.hm_task0[-1].bias.data.tolist()} (expected [-0.375])')
 
         if True:
-            # extract features - run all sensor backbones for the frame
-            img_feats, radar_feats, pts_feats = self.extract_feat(
-                points, img=img, radar=radar, img_metas=img_metas)
+            # backbone outputs for this frame, computed batched in forward_train
+            img_feats, radar_feats, pts_feats = feats
 
             ref_box_sizes = torch.cat(
                 [track_instances.pred_boxes[:, 2:4],
@@ -657,7 +657,7 @@ class ViP3D(MVXTwoStageDetector):
             filled = self._fill_empty_slots(
                 track_instances, heatmap, feat_for_queries, img_metas)
 
-            if self.bev_vis and filled is not None:
+            if vis and filled is not None:
                 # debug vis - store top-20 for SMCA visualisation
                 from .bev_vis import set_top_queries as _set_tq
                 top20_idx = filled[:20]
@@ -671,7 +671,7 @@ class ViP3D(MVXTwoStageDetector):
                 frame_idx = self.criterion._current_frame_idx
                 self.criterion.losses_dict[f'frame_{frame_idx}_heatmap_loss'] = heatmap_loss
 
-            if self.bev_vis:
+            if vis:
                 visualize_bev(bev_feat, heatmap, gt_hm_vis)
         # LiVip add end
 
@@ -687,13 +687,10 @@ class ViP3D(MVXTwoStageDetector):
             cur_ego_r=l2g_r1, cur_ego_t=l2g_t1, time_delta=time_delta)
 
         # SMCA attention visualisation (runs after pts_bbox_head so attn is collected)
-        if self.bev_vis and self.use_lidar and pts_feats is not None:
+        if vis and self.use_lidar and pts_feats is not None:
             from .bev_vis import visualize_train_smca as _vis_smca, visualize_smca_gauss as _vis_gauss
             _vis_smca(heatmap, img)
             _vis_gauss(img)
-
-        if self.add_branch:
-            self.update_history_img_list(img_metas, img, img_feats)
 
         out = {'pred_logits': output_classes[-1],
                'pred_boxes': output_coords[-1],
@@ -776,9 +773,9 @@ class ViP3D(MVXTwoStageDetector):
         visible = (depth > 0) & (u > 0) & (u < img_w) & (v > 0) & (v < img_h)
         return visible.any(dim=1)
 
-    def _build_gt_instances(self, gt_bboxes_3d, gt_labels_3d, instance_inds,
+    def _build_gt_instances(self, b, gt_bboxes_3d, gt_labels_3d, instance_inds,
                             img, img_metas, device):
-        """One GT `Instances` per clip frame, as ClipMatcher expects them.
+        """One GT `Instances` per frame of clip `b`, as ClipMatcher expects them.
 
         Boxes are put into the head's regression space (normalize_bbox) and
         each gets a `vis_mask`. Invisible boxes stay in the list -- keeping the
@@ -790,16 +787,16 @@ class ViP3D(MVXTwoStageDetector):
         check_cam_vis = (img is not None) and (self.pts_bbox_head.num_cams < 6)
 
         gt_instances_list = []
-        for i, frame_boxes in enumerate(gt_bboxes_3d[0]):
+        for i, frame_boxes in enumerate(gt_bboxes_3d[b]):
             boxes = frame_boxes.tensor.to(device)
             if check_cam_vis:
                 vis_mask = self._gt_camera_visibility(
-                    boxes, img_metas[0]['lidar2img'][i], img.shape[-2], img.shape[-1])
+                    boxes, img_metas[b]['lidar2img'][i], img.shape[-2], img.shape[-1])
             else:
                 vis_mask = torch.ones(len(boxes), dtype=torch.bool, device=device)
 
             gt_instances = self._targets_to_instances(
-                normalize_bbox(boxes, self.pc_range), gt_labels_3d[0][i], instance_inds[0][i])
+                normalize_bbox(boxes, self.pc_range), gt_labels_3d[b][i], instance_inds[b][i])
             gt_instances.vis_mask = vis_mask
             gt_instances_list.append(gt_instances)
         #     print(f'[GT vis] frame {i}: {vis_mask.sum().item()}/{len(vis_mask)} visible')
@@ -807,6 +804,20 @@ class ViP3D(MVXTwoStageDetector):
         # kept  = sum(g.vis_mask.sum().item() for g in gt_instances_list)
         # print(f'[GT vis] clip total: {kept}/{total} visible ({100*kept//max(total,1)}%)')
         return gt_instances_list
+
+    @staticmethod
+    def _slice_batch(x, b):
+        """Sample `b` of a batched backbone output, kept as a batch of one.
+
+        Lists come back as new lists: the detection head writes positional
+        encodings into the image feature list in place, and that must stay
+        within the clip it was computed for.
+        """
+        if x is None:
+            return None
+        if isinstance(x, (list, tuple)):
+            return type(x)(ViP3D._slice_batch(e, b) for e in x)
+        return x[b:b + 1]
 
     def forward_train(self,
                       points=None,
@@ -824,6 +835,10 @@ class ViP3D(MVXTwoStageDetector):
                       **kwargs,
                       ):
         """Forward training function.
+
+        The sensor backbones run once per frame for the whole batch; tracking
+        and prediction then run clip by clip (_forward_train_single), and the
+        loss terms are averaged over the B = samples_per_gpu clips.
         Args:
             points (list(list[torch.Tensor]), optional): B-T-sample
                 Points of each sample.
@@ -841,53 +856,109 @@ class ViP3D(MVXTwoStageDetector):
             l2g_r_mat (list[Tensor]). element shape [T, 3, 3]
             l2g_t (list[Tensor]). element shape [T, 3]
                 points @ R_Mat + T
+            timestamp (list[Tensor]). T elements of shape [B]
             gt_bboxes_ignore (list[torch.Tensor], optional): Ground truth
                 2D boxes in images to be ignored. Defaults to None.
         Returns:
-            dict: Losses of different branches.
+            dict: Losses of different branches, each the mean over the clips.
+        """
+
+        bs = len(gt_bboxes_3d)              # batch size = samples_per_gpu
+        num_frame = l2g_r_mat[0].size(0)    # T frames per clip, the same for every clip
+
+        # backbones: one batched pass per frame
+        frame_feats = []
+        frame_img_metas = []
+        for i in range(num_frame):
+
+            # take out the i-th frame from full sequence; None if lidar-only
+            points_single = [p_[i] for p_ in points] if points is not None else None
+            img_single = torch.stack([img_[i] for img_ in img], dim=0) if img is not None else None  # None for lidar-only
+            radar_single = torch.stack([radar_[i] for radar_ in radar], dim=0) if radar is not None else None
+
+            img_metas_single = deepcopy(img_metas)
+            if img is not None:  # only set per-frame lidar2img when camera is active
+                for b in range(bs):
+                    # img_metas[b]['lidar2img'][i] gives the [num_cam, 4, 4]
+                    img_metas_single[b]['lidar2img'] = img_metas[b]['lidar2img'][i]
+
+            frame_feats.append(self.extract_feat(
+                points_single, img=img_single, radar=radar_single, img_metas=img_metas_single))
+            frame_img_metas.append(img_metas_single)
+
+        # tracking + prediction: one clip at a time
+        losses_per_clip = []
+        for b in range(bs):
+            losses_per_clip.append(self._forward_train_single(
+                b,
+                [self._slice_batch(feats, b) for feats in frame_feats],
+                [metas[b:b + 1] for metas in frame_img_metas],
+                img=img, img_metas=img_metas,
+                gt_bboxes_3d=gt_bboxes_3d, gt_labels_3d=gt_labels_3d,
+                instance_inds=instance_inds, l2g_r_mat=l2g_r_mat, l2g_t=l2g_t,
+                timestamp=timestamp, instance_idx_2_labels=instance_idx_2_labels,
+                **kwargs))
+
+        # Each clip's terms are already normalised within that clip (per-frame
+        # avg_factors in ClipMatcher and _heatmap_loss), so the batch loss is
+        # their plain mean -- B=1 returns the clip's own values.
+        keys = losses_per_clip[0].keys()
+        assert all(clip.keys() == keys for clip in losses_per_clip), \
+            'clips in one batch produced different loss terms'
+        losses = {key: sum(clip[key] for clip in losses_per_clip) / bs for key in keys}
+
+        others_dict = {}
+        return losses, others_dict
+
+    def _forward_train_single(self, b, frame_feats, frame_img_metas,
+                              img=None,
+                              img_metas=None,
+                              gt_bboxes_3d=None,
+                              gt_labels_3d=None,
+                              instance_inds=None,
+                              l2g_r_mat=None,
+                              l2g_t=None,
+                              timestamp=None,
+                              instance_idx_2_labels=None,
+                              **kwargs,
+                              ):
+        """Track and predict clip `b` of the batch; returns its losses.
+
+        frame_feats[i] / frame_img_metas[i] are frame i's backbone outputs and
+        metas for this clip only, as a batch of one. The other arguments are
+        forward_train's full-batch inputs and are indexed with [b] here.
+        Track queries, ClipMatcher clip state and the prediction track history
+        all start fresh for the clip, so nothing is shared between clips.
         """
 
         # [T, 3, 3]
-        l2g_r_mat = l2g_r_mat[0]
+        l2g_r_mat = l2g_r_mat[b]
         # change to [T, 1, 3]
-        l2g_t = l2g_t[0].unsqueeze(dim=1)
+        l2g_t = l2g_t[b].unsqueeze(dim=1)
 
-        timestamp = timestamp
-
-        bs = len(gt_bboxes_3d)          # batch size (always 1)
         num_frame = l2g_r_mat.size(0)   # T frames in this clip
         track_instances = self._generate_empty_tracks()
 
         # device from the lidar pose tensor -- img may be None
         gt_instances_list = self._build_gt_instances(
-            gt_bboxes_3d, gt_labels_3d, instance_inds, img, img_metas,
+            b, gt_bboxes_3d, gt_labels_3d, instance_inds, img, img_metas,
             device=l2g_r_mat.device)
 
         # reset call at the start of each training sample
         self.criterion.initialize_for_single_clip(gt_instances_list)
 
-        others_dict = {}
         mapping = None
         if self.do_pred:
-            mapping = kwargs['mapping'][0]
+            mapping = kwargs['mapping'][b]
             same_scene = mapping['same_scene']
             valid_pred = mapping['valid_pred']
+        # the predictor takes batched inputs: hand it this clip as a batch of one
+        kwargs = {key: value[b:b + 1] if value is not None else None
+                  for key, value in kwargs.items()}
 
         if True:
-            # for bs 1
-            # extract lidar-image projection matrices for each frame; None if lidar-only
-            lidar2img = img_metas[0]['lidar2img'] if img is not None else None  # [T, num_cam]; None for lidar-only
+            vis = self.bev_vis and b == 0   # the visualiser follows the first clip only
             for i in range(num_frame):
-
-                # take out the i-th frame from full sequence; None if lidar-only
-                points_single = [p_[i] for p_ in points] if points is not None else None
-                img_single = torch.stack([img_[i] for img_ in img], dim=0) if img is not None else None  # None for lidar-only
-                radar_single = torch.stack([radar_[i] for radar_ in radar], dim=0) if radar is not None else None
-
-                img_metas_single = deepcopy(img_metas)
-                if lidar2img is not None:  # only set per-frame lidar2img when camera is active
-                    #img_metas[0]['lidar2img'][i] gives the [num_cam, 4, 4]
-                    img_metas_single[0]['lidar2img'] = lidar2img[i]
 
                 if i == num_frame - 1:
                     l2g_r2 = None
@@ -896,19 +967,21 @@ class ViP3D(MVXTwoStageDetector):
                 else:
                     l2g_r2 = l2g_r_mat[i + 1]
                     l2g_t2 = l2g_t[i + 1]
-                    time_delta = timestamp[i + 1] - timestamp[i]
+                    time_delta = timestamp[i + 1][b:b + 1] - timestamp[i][b:b + 1]
 
                 is_last_frame = i == num_frame - 1
 
                 if True:
-                    track_instances = self._forward_single(points_single, img_single,
-                                                           radar_single, img_metas_single,
+                    track_instances = self._forward_single(frame_feats[i],
+                                                           img[b][i] if img is not None else None,  # [num_cam, 3, H, W]
+                                                           frame_img_metas[i],
                                                            track_instances,
                                                            l2g_r_mat[i], l2g_t[i],
                                                            l2g_r2, l2g_t2, time_delta, is_last_frame,
-                                                           gt_bboxes_3d=predictor_utils.tensors_tracking_to_detection(gt_bboxes_3d, i),
-                                                           gt_labels_3d=predictor_utils.tensors_tracking_to_detection(gt_labels_3d, i),
-                                                           mapping=mapping)
+                                                           gt_bboxes_3d=predictor_utils.tensors_tracking_to_detection(gt_bboxes_3d[b:b + 1], i),
+                                                           gt_labels_3d=predictor_utils.tensors_tracking_to_detection(gt_labels_3d[b:b + 1], i),
+                                                           mapping=mapping,
+                                                           vis=vis)
 
                 if True:
                     track_instances = Instances.cat([track_instances, self._generate_empty_tracks()])
@@ -917,7 +990,7 @@ class ViP3D(MVXTwoStageDetector):
                     track_ids = []
                     decoded_boxes = []
 
-                    all_decoded_boxes = predictor_utils.to_numpy(predictor_utils.get_decoded_boxes(track_instances.pred_boxes, self.pc_range, img_metas).tensor)
+                    all_decoded_boxes = predictor_utils.to_numpy(predictor_utils.get_decoded_boxes(track_instances.pred_boxes, self.pc_range, img_metas[b:b + 1]).tensor)
                     for j in range(len(track_instances)):
                         obj_id = track_instances.obj_idxes[j].item()
                         if obj_id != -1 and obj_id != -2:
@@ -931,18 +1004,19 @@ class ViP3D(MVXTwoStageDetector):
                             decoded_boxes.append(all_decoded_boxes[j])
 
                     if i == 0:
-                        self.track_idx_2_boxes = defaultdict(dict)
-                        self.track_idx_2_boxes_in_lidar = defaultdict(dict)
+                        # this clip's track history, local so it cannot leak into the next clip
+                        track_idx_2_boxes = defaultdict(dict)
+                        track_idx_2_boxes_in_lidar = defaultdict(dict)
 
                     # mapping must use last mapping
                     r_index_2_rotation_and_transform = mapping['r_index_2_rotation_and_transform']
                     if valid_pred:
-                        predictor_utils.update_track_idx_2_boxes(self.track_idx_2_boxes, track_ids, decoded_boxes, r_index_2_rotation_and_transform[i], i)
-                        predictor_utils.update_track_idx_2_boxes_in_lidar(self.track_idx_2_boxes_in_lidar, track_ids, decoded_boxes, r_index_2_rotation_and_transform[i], i)
+                        predictor_utils.update_track_idx_2_boxes(track_idx_2_boxes, track_ids, decoded_boxes, r_index_2_rotation_and_transform[i], i)
+                        predictor_utils.update_track_idx_2_boxes_in_lidar(track_idx_2_boxes_in_lidar, track_ids, decoded_boxes, r_index_2_rotation_and_transform[i], i)
 
         if self.do_pred:
 
-            instance_idx_2_labels = instance_idx_2_labels[0]
+            instance_idx_2_labels = instance_idx_2_labels[b]
             device = track_instances.output_embedding.device
 
             if not valid_pred:
@@ -992,8 +1066,12 @@ class ViP3D(MVXTwoStageDetector):
                             if self.add_branch:
                                 output_embedding = output_embedding[torch.tensor(agents_indices, dtype=torch.long, device=device)]
                                 _, _, past_boxes_list_in_lidar, _, _ = \
-                                    predictor_utils.extract_from_track_idx_2_boxes(self.track_idx_2_boxes_in_lidar, track_scores, track_ids, track_labels, mapping, num_frame - 1)
-                                query = self.add_branch_update_query(output_embedding, past_boxes_list_in_lidar[:, -1, :3], device)
+                                    predictor_utils.extract_from_track_idx_2_boxes(track_idx_2_boxes_in_lidar, track_scores, track_ids, track_labels, mapping, num_frame - 1)
+                                # attend to this clip's last frame: frame_feats[-1][0] is its
+                                # image feature list (None for lidar-only), which the detection
+                                # head has already added its positional encodings to
+                                query = self.add_branch_update_query(output_embedding, past_boxes_list_in_lidar[:, -1, :3], device,
+                                                                     history=(frame_feats[-1][0], frame_img_metas[-1]))
                                 output_embedding = output_embedding + query
 
                             output_embedding = self.output_embedding_forward(output_embedding)
@@ -1029,8 +1107,8 @@ class ViP3D(MVXTwoStageDetector):
 
             self.criterion.update_prediction_loss(loss)
 
-        outputs = self.criterion.losses_dict
-        return outputs, others_dict
+        # a copy: the criterion's dict is reset for the next clip
+        return dict(self.criterion.losses_dict)
 
     def _inference_single(self, points, img, radar, img_metas, track_instances,
                           l2g_r1=None, l2g_t1=None, l2g_r2=None, l2g_t2=None,
@@ -1458,16 +1536,24 @@ class ViP3D(MVXTwoStageDetector):
             self.history_img_metas = self.history_img_metas[1:]
             self.history_img_list = self.history_img_list[1:]
 
-    def add_branch_update_query(self, output_embedding, reference_points, device):
+    def add_branch_update_query(self, output_embedding, reference_points, device,
+                                history=None):
+        # history: (img_feats, img_metas) of the frame to attend to. Training
+        # passes its clip's own last frame; inference leaves it None and uses
+        # what update_history_img_list recorded.
+        if history is None:
+            history = (self.history_img_feats[-1], self.history_img_metas[-1])
+        img_feats, img_metas = history
+
         reference_points = predictor_utils.reference_points_lidar_to_relative(reference_points, self.pc_range)
         reference_points = torch.tensor(reference_points, dtype=torch.float, device=device)
 
         query = self.add_branch_mlp(output_embedding)
-        if self.history_img_feats[-1] is not None:  # skip camera cross-attn for lidar-only
+        if img_feats is not None:  # skip camera cross-attn for lidar-only
             query = self.add_branch_attention(query=query.unsqueeze(1),
                                               reference_points=reference_points.unsqueeze(0),
-                                              value=self.history_img_feats[-1],
-                                              img_metas=self.history_img_metas[-1])
+                                              value=img_feats,
+                                              img_metas=img_metas)
             assert query.shape == (len(output_embedding), 1, 256)
             query = query.squeeze(1)
         return query
