@@ -1,16 +1,18 @@
 _base_ = [
-    '../_base_/nus-3d.py',
-    '../_base_/default_runtime.py'
+    '../../_base_/nus-3d.py',
+    '../../_base_/default_runtime.py'
 ]
-# TransFusion Table 7 ablation, "w/o Guide" cell: SMCA feature fusion ON,
-# image-guided query init OFF. Stage 2 of the paper's 2-stage scheme --
+# TransFusion Table 7 ablation, "w/o Fusion" cell: image-guided query init
+# ON, SMCA feature fusion OFF. Stage 2 of the paper's 2-stage scheme --
 # loads directly from stage 1's (augmented/livip3d_resnet50_lidar_only.py)
-# finished checkpoint, sibling to livip3d_resnet50_lidar_img_guided.py
-# ("w/o Fusion") and livip3d_resnet50_lidar_img_guided_smca.py (full
-# model). No point-cloud geometric augmentation here, same reasoning as
-# the other two stage-2 configs: SMCA's cross attention is keyed off
-# projected query centers using calibration matrices that augmentation
-# would desync from the (unaugmented) camera images.
+# finished checkpoint. No point-cloud geometric augmentation here: this
+# stage's image-guided heatmap (img_hm_task*) is built from a LiDAR-BEV/
+# image cross-attention projection computed from calibration matrices
+# that are NOT re-derived after augmentation (see dataset.py get_data_info),
+# so flip/rotate/scale would desync LiDAR geometry from the image
+# projection this stage is training. Trained identically to the
+# "w/o Guide" and full-model siblings (fix_lidar=True, 6 epochs) so the
+# ablation only isolates the img-guided/SMCA toggles.
 workflow = [('train', 1)]
 plugin = True
 plugin_dir = 'plugin/'
@@ -48,7 +50,7 @@ model = dict(
         pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0],
         max_num=100,
         num_classes=7),
-    fix_feats=True,   # camera backbone frozen
+    fix_feats=True,   # camera backbone frozen — img guided uses frozen features
     fix_lidar=True,   # stage 1 LiDAR backbone already converged; only train new modules
     score_thresh=0.4,
     filter_score_thresh=0.35,
@@ -159,7 +161,7 @@ model = dict(
                 num_heads=8,
                 ffn_dims=512,
                 dropout=0.1,
-                use_smca=True,
+                use_smca=False,
                 lidar_bev_attn=dict(
                     type='LiDARBEVDeformCrossAtten',
                     embed_dims=256,
@@ -175,9 +177,7 @@ model = dict(
                     num_cams=6,
                     num_levels=4,
                     pc_range=point_cloud_range,
-                    dropout=0.1,
-                    sigma_scale=1.0,
-                    feat_level=0),
+                    dropout=0.1),
             )),
         pc_range=point_cloud_range,
         positional_encoding=dict(
@@ -189,8 +189,8 @@ model = dict(
     debug=False,
     bev_vis=True,
     vis_interval=20,
-    use_img_guided=False,
-    use_smca=True,
+    use_img_guided=True,
+    use_smca=False,
     do_pred=True,
     relative_pred=True,
     agents_layer_0=True,
@@ -341,7 +341,7 @@ optimizer = dict(
             'hm_task2':    dict(lr_mult=0.1),
             'hm_task4':    dict(lr_mult=0.1),
             'hm_task5':    dict(lr_mult=0.1),
-            # smca_attn and other new fusion modules use base lr (2e-4)
+            # img_bev_proj and img_hm_* use base lr (2e-4) — new modules, full lr
         }),
     weight_decay=0.01)
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
@@ -358,5 +358,5 @@ evaluation = dict(interval=6)
 runner = dict(type='EpochBasedRunner', max_epochs=6)
 
 find_unused_parameters = True
-load_from = 'work_dirs/s1-livip3d_lidar_only_augmented/epoch_20.pth'
+load_from = 'work_dirs/augmented/s1-lidar_only/epoch_20.pth'
 # fp16 = dict(loss_scale='dynamic')

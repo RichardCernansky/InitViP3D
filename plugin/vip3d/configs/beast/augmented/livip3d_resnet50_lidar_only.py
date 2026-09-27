@@ -1,7 +1,14 @@
 _base_ = [
-    '../_base_/nus-3d.py',
-    '../_base_/default_runtime.py'
+    '../../_base_/nus-3d.py',
+    '../../_base_/default_runtime.py'
 ]
+# Stage 1 (LiDAR-only), augmented, with the prediction head on. Same
+# augmentation, init, schedule and fade as
+# livip3d_resnet50_lidar_only_detect_only.py, plus trajectory prediction
+# configured as in the non-augmented S1 run. Prediction targets and lanes
+# follow the augmentation (see NuScenesTrackDatasetRadar._move_augmented_box /
+# _augment_lane).
+#
 # TransFusion-style augmentation recipe (Sec. 4 of the paper): copy-paste
 # GT sampling (faded out for the last 5 of 20 epochs, see custom_hooks
 # below), random flip along both BEV axes, global rotation +/- pi/8,
@@ -126,9 +133,9 @@ model = dict(
             alpha=0.25,
             loss_weight=2.0),
         loss_bbox=dict(type='L1Loss', loss_weight=0.25),
-        # BEV heatmap supervision for query initialisation (CenterPoint
-        # alpha/gamma). loss_weight=1.0 is the weight this term had when
-        # it was hard-coded in ViP3D._heatmap_loss.
+        # BEV heatmap supervision for query initialisation. alpha/gamma match
+        # CenterPoint; loss_weight=1.0 reproduces the previous hard-coded
+        # behaviour, where this term was ~a third of the total loss.
         loss_heatmap=dict(
             type='GaussianFocalLoss',
             alpha=2.0,
@@ -184,14 +191,23 @@ model = dict(
             offset=-0.5),
     ),
     debug=False,
-    bev_vis=True,
+    bev_vis=False,
     vis_interval=20,
     use_img_guided=False,
     use_smca=False,
-    do_pred=False,
-    relative_pred=False,
-    agents_layer_0=False,
-    add_branch=False,
+    do_pred=True,
+    relative_pred=True,
+    agents_layer_0=True,
+    add_branch=True,
+    predictor=dict(
+        hidden_size=128,
+        laneGCN=True,
+        decoder=dict(
+            variety_loss=True,
+            variety_loss_prob=True,
+            hidden_size=128,
+        ),
+    ),
     train_cfg=dict(
         pts=dict(
             grid_size=[512, 512, 1],
@@ -293,7 +309,8 @@ train_pipeline_post = [
     dict(type='FormatBundle3DTrack'),
     dict(type='Collect3D', keys=[
         'gt_bboxes_3d', 'gt_labels_3d', 'instance_inds',
-        'points', 'timestamp', 'l2g_r_mat', 'l2g_t']),
+        'points', 'timestamp', 'l2g_r_mat', 'l2g_t',
+        'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels']),
 ]
 
 test_pipeline = [
@@ -317,7 +334,8 @@ test_pipeline_post = [
     dict(type='FormatBundle3DTrack'),
     dict(type='Collect3D', keys=[
         'gt_bboxes_3d', 'gt_labels_3d',
-        'points', 'timestamp', 'l2g_r_mat', 'l2g_t']),
+        'points', 'timestamp', 'l2g_r_mat', 'l2g_t',
+        'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels']),
 ]
 
 data = dict(
@@ -338,7 +356,7 @@ data = dict(
             use_valid_flag=True,
             box_type_3d='LiDAR',
             camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'],
-            do_pred=False)),
+            do_pred=True)),
     val=dict(
         type=dataset_type,
         pipeline_single=test_pipeline,
@@ -348,7 +366,7 @@ data = dict(
         ann_file=data_root + 'nuscenes_tracking_infos_val.pkl',
         num_frames_per_sample=1,
         camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'],
-        do_pred=False),
+        do_pred=True),
     test=dict(
         type=dataset_type,
         pipeline_single=test_pipeline,
@@ -358,7 +376,7 @@ data = dict(
         ann_file=data_root + 'nuscenes_tracking_infos_val.pkl',
         num_frames_per_sample=1,
         camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'],
-        do_pred=False))
+        do_pred=True))
 
 optimizer = dict(
     type='AdamW',

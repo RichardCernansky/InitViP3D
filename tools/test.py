@@ -1,5 +1,6 @@
 import argparse
 import mmcv
+import multiprocessing as mp
 import os
 import torch
 import warnings
@@ -79,7 +80,7 @@ def parse_args():
         choices=['none', 'pytorch', 'slurm', 'mpi'],
         default='none',
         help='job launcher')
-    parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument('--local-rank', '--local_rank', type=int, default=0)
     parser.add_argument('--output_dir', default=None)
 
     args = parser.parse_args()
@@ -171,6 +172,9 @@ def main():
         distributed = False
     else:
         distributed = True
+        # fork like single-GPU runs: workers share the dataset instead of each unpickling a copy
+        # (init_dist would otherwise set spawn)
+        mp.set_start_method('fork', force=True)
         init_dist(args.launcher, **cfg.dist_params)
 
     # set random seeds

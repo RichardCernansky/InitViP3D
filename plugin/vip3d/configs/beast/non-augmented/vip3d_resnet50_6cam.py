@@ -1,6 +1,6 @@
 _base_ = [
-    './_base_/nus-3d.py',
-    './_base_/default_runtime.py'
+    '../../_base_/nus-3d.py',
+    '../../_base_/default_runtime.py'
 ]
 workflow = [('train', 1)]
 plugin = True
@@ -16,9 +16,13 @@ class_names = [
     'car', 'truck', 'bus', 'trailer',
     'motorcycle', 'bicycle', 'pedestrian',
 ]
+prediction_eval_classes = [
+    'car', 'truck', 'bus', 'trailer',
+    'motorcycle', 'bicycle', 'pedestrian',
+]
 
 input_modality = dict(
-    use_lidar=True,
+    use_lidar=False,
     use_camera=True,
     use_radar=False,
     use_map=False,
@@ -26,9 +30,10 @@ input_modality = dict(
 
 model = dict(
     type='ViP3D',
-    use_grid_mask=True,  # use grid mask
+    use_grid_mask=True,
     num_classes=7,
     num_query=300,
+    use_lidar=False,
     bbox_coder=dict(
         type='DETRTrack3DCoder',
         post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
@@ -47,55 +52,9 @@ model = dict(
         memory_bank_score_thresh=0.0,
         memory_bank_len=4,
     ),
-    radar_encoder=dict(
-        type='RadarPointEncoderXY',
-        in_channels=13,
-        out_channels=[32],
-        norm_cfg=dict(type='BN1d', eps=1e-3, momentum=0.01), ),
-# ---- added LiVip3D
-    use_lidar=True,
-    lidar_bev_channels=384,
-    lidar_voxel_size=[0.2, 0.2, 8],
-    lidar_out_size_factor=4,
-    pts_voxel_layer=dict(
-        max_num_points=20,
-        voxel_size=[0.2, 0.2, 8],
-        max_voxels=(30000, 40000),
-        point_cloud_range=point_cloud_range),
-    pts_voxel_encoder=dict(
-        type='PillarFeatureNet',
-        in_channels=5,
-        feat_channels=[64],
-        with_distance=False,
-        voxel_size=[0.2, 0.2, 8],
-        norm_cfg=dict(type='BN1d', eps=1e-3, momentum=0.01),
-        point_cloud_range=point_cloud_range),
-    pts_middle_encoder=dict(
-        type='PointPillarsScatter',
-        in_channels=64,
-        output_shape=[512, 512]),
-    pts_backbone=dict(
-        type='SECOND',
-        in_channels=64,
-        out_channels=[128, 256],
-        layer_nums=[3, 5],
-        layer_strides=[2, 2],
-        norm_cfg=dict(type='BN', eps=1e-3, momentum=0.01),
-        conv_cfg=dict(type='Conv2d', bias=False)),
-    pts_neck=dict(
-        type='SECONDFPN',
-        in_channels=[128, 256],
-        out_channels=[128, 256],
-        upsample_strides=[1, 2],
-        norm_cfg=dict(type='BN', eps=1e-3, momentum=0.01),
-        upsample_cfg=dict(type='deconv', bias=False),
-        use_conv_for_no_stride=False),
-# ----- added LiVip3D
     img_backbone=dict(
         type='ResNet',
         with_cp=False,
-        # with_cp=True,
-        # pretrained='open-mmlab://detectron2/resnet50_caffe',
         depth=50,
         num_stages=4,
         out_indices=(0, 1, 2, 3),
@@ -144,7 +103,7 @@ model = dict(
         type='DeformableDETR3DCamHeadTrackPlusRaw',
         num_classes=7,
         in_channels=256,
-        num_cams=3,
+        num_cams=6,
         num_feature_levels=4,
         with_box_refine=True,
         transformer=dict(
@@ -177,7 +136,8 @@ model = dict(
             type='SinePositionalEncoding',
             num_feats=128,
             normalize=True,
-            offset=-0.5), ),
+            offset=-0.5),
+    ),
     do_pred=True,
     relative_pred=True,
     agents_layer_0=True,
@@ -191,7 +151,6 @@ model = dict(
             hidden_size=128,
         ),
     ),
-    # model training and testing settings
     train_cfg=dict(
         pts=dict(
             grid_size=[512, 512, 1],
@@ -213,66 +172,38 @@ model = dict(
     ),
 )
 
-# x y z rcs vx vy vx_comp vy_comp x_rms y_rms vx_rms vy_rms
-radar_use_dims = [0, 1, 2, 5, 6, 7, 8, 9, 12, 13, 16, 17, 18]
 dataset_type = 'NuScenesTrackDatasetRadar'
 data_root = 'data/nuscenes/'
-
 file_client_args = dict(backend='disk')
 
 train_pipeline = [
-    dict(
-        type='LoadPointsFromFile',
-        coord_type='LIDAR',
-        load_dim=5,
-        use_dim=5,
-        file_client_args=file_client_args),
     dict(type='LoadMultiViewImageFromFiles'),
-    dict(
-        type='LoadRadarPointsMultiSweeps',
-        load_dim=18,
-        sweeps_num=1,
-        use_dim=radar_use_dims,
-        max_num=100, ),
+    dict(type='ResizeMultiViewKeepRatio', scale=(960, 544), keep_ratio=True),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
     dict(type='InstanceRangeFilter', point_cloud_range=point_cloud_range),
-    # dict(type='ObjectNameFilter', classes=class_names),
-    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
-    dict(type='PadMultiViewImage', size_divisor=32)
-]
-
-train_pipeline_post = [
-    dict(type='FormatBundle3DTrack'),
-    dict(type='Collect3D', keys=['points', 'gt_bboxes_3d', 'gt_labels_3d', 'instance_inds', 'img', 'timestamp', 'l2g_r_mat', 'l2g_t', 'radar',
-                                 'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels'])
-]
-test_pipeline = [
-    dict(
-        type='LoadPointsFromFile',
-        coord_type='LIDAR',
-        load_dim=5,
-        use_dim=5,
-        file_client_args=file_client_args),
-    dict(type='LoadMultiViewImageFromFiles'),
-    dict(
-        type='LoadRadarPointsMultiSweeps',
-        load_dim=18,
-        sweeps_num=1,
-        use_dim=radar_use_dims,
-        max_num=100, ),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='PadMultiViewImage', size_divisor=32),
 ]
-
-test_pipeline_post = [
+train_pipeline_post = [
     dict(type='FormatBundle3DTrack'),
-    dict(type='Collect3D', keys=['points', 'img', 'timestamp', 'l2g_r_mat', 'l2g_t', 'radar',
-                                 'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels'])
-    # dict(type='Collect3D', keys=['points', 'img',])
+    dict(type='Collect3D', keys=[
+        'gt_bboxes_3d', 'gt_labels_3d', 'instance_inds', 'img',
+        'timestamp', 'l2g_r_mat', 'l2g_t',
+        'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels']),
 ]
 
-# construct a pipeline for data and gt loading in show function
-# please keep its loading function consistent with test_pipeline (e.g. client)
+test_pipeline = [
+    dict(type='LoadMultiViewImageFromFiles'),
+    dict(type='ResizeMultiViewKeepRatio', scale=(960, 544), keep_ratio=True),
+    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
+    dict(type='PadMultiViewImage', size_divisor=32),
+]
+test_pipeline_post = [
+    dict(type='FormatBundle3DTrack'),
+    dict(type='Collect3D', keys=[
+        'img', 'timestamp', 'l2g_r_mat', 'l2g_t',
+        'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels']),
+]
 
 data = dict(
     samples_per_gpu=1,
@@ -288,38 +219,39 @@ data = dict(
         modality=input_modality,
         test_mode=False,
         use_valid_flag=True,
-        # we use box_type_3d='LiDAR' in kitti and nuscenes dataset
-        # and box_type_3d='Depth' in sunrgbd and scannet dataset.
         box_type_3d='LiDAR',
-        camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT'],
+        camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'],
         do_pred=True),
-    # ),
-    val=dict(type=dataset_type, pipeline_single=test_pipeline, pipeline_post=test_pipeline_post, classes=class_names, modality=input_modality,
-             ann_file=data_root + 'nuscenes_tracking_infos_val.pkl',
-             num_frames_per_sample=1,
-             camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT'],
-             do_pred=True),
-    test=dict(type=dataset_type, pipeline_single=test_pipeline,
-              pipeline_post=test_pipeline_post,
-              classes=class_names, modality=input_modality,
-              ann_file=data_root + 'nuscenes_tracking_infos_val.pkl',
-              num_frames_per_sample=1,
-                camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT'],
-              do_pred=True))
+    val=dict(
+        type=dataset_type,
+        pipeline_single=test_pipeline,
+        pipeline_post=test_pipeline_post,
+        classes=class_names,
+        modality=input_modality,
+        ann_file=data_root + 'nuscenes_tracking_infos_val.pkl',
+        num_frames_per_sample=1,
+        camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'],
+        do_pred=True),
+    test=dict(
+        type=dataset_type,
+        pipeline_single=test_pipeline,
+        pipeline_post=test_pipeline_post,
+        classes=class_names,
+        modality=input_modality,
+        ann_file=data_root + 'nuscenes_tracking_infos_val.pkl',
+        num_frames_per_sample=1,
+        camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'],
+        do_pred=True))
 
 optimizer = dict(
     type='AdamW',
-    # type='SGD',
     lr=2e-4,
     paramwise_cfg=dict(
         custom_keys={
             'img_backbone': dict(lr_mult=0.1),
-            'pts_backbone': dict(lr_mult=0.1),
-            'pts_neck':     dict(lr_mult=0.1),
         }),
     weight_decay=0.01)
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
-# learning policy
 lr_config = dict(
     policy='CosineAnnealing',
     warmup='linear',
@@ -327,13 +259,12 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
 )
+
 total_epochs = 24
 evaluation = dict(interval=24)
-
 runner = dict(type='EpochBasedRunner', max_epochs=24)
 
 find_unused_parameters = True
-# load_from = 'ckpt_init/livip3d_init.pth'
 load_from = 'ckpt_init/detr3d_resnet50.pth'
 
-fp16 = dict(loss_scale='dynamic')
+# fp16 = dict(loss_scale='dynamic')

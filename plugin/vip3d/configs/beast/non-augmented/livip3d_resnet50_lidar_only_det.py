@@ -1,6 +1,6 @@
 _base_ = [
-    './_base_/nus-3d.py',
-    './_base_/default_runtime.py'
+    '../../_base_/nus-3d.py',
+    '../../_base_/default_runtime.py'
 ]
 workflow = [('train', 1)]
 plugin = True
@@ -16,14 +16,10 @@ class_names = [
     'car', 'truck', 'bus', 'trailer',
     'motorcycle', 'bicycle', 'pedestrian',
 ]
-prediction_eval_classes = [
-    'car', 'truck', 'bus', 'trailer',
-    'motorcycle', 'bicycle', 'pedestrian',
-]
 
 input_modality = dict(
     use_lidar=True,
-    use_camera=True,
+    use_camera=False,
     use_radar=False,
     use_map=False,
     use_external=False)
@@ -39,7 +35,7 @@ model = dict(
         pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0],
         max_num=100,
         num_classes=7),
-    fix_feats=True,   # camera backbone frozen — img guided uses frozen features
+    fix_feats=True,
     fix_lidar=False,
     score_thresh=0.4,
     filter_score_thresh=0.35,
@@ -178,21 +174,11 @@ model = dict(
     debug=False,
     bev_vis=True,
     vis_interval=20,
-    use_img_guided=True,
     use_smca=False,
-    do_pred=True,
-    relative_pred=True,
-    agents_layer_0=True,
-    add_branch=True,
-    predictor=dict(
-        hidden_size=128,
-        laneGCN=True,
-        decoder=dict(
-            variety_loss=True,
-            variety_loss_prob=True,
-            hidden_size=128,
-        ),
-    ),
+    do_pred=False,
+    relative_pred=False,
+    agents_layer_0=False,
+    add_branch=False,
     train_cfg=dict(
         pts=dict(
             grid_size=[512, 512, 1],
@@ -219,8 +205,6 @@ data_root = 'data/nuscenes/'
 file_client_args = dict(backend='disk')
 
 train_pipeline = [
-    dict(type='LoadMultiViewImageFromFiles'),
-    dict(type='ResizeMultiViewKeepRatio', scale=(960, 544), keep_ratio=True),
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
@@ -237,20 +221,15 @@ train_pipeline = [
         remove_close=True),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
     dict(type='InstanceRangeFilter', point_cloud_range=point_cloud_range),
-    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
-    dict(type='PadMultiViewImage', size_divisor=32),
 ]
 train_pipeline_post = [
     dict(type='FormatBundle3DTrack'),
     dict(type='Collect3D', keys=[
-        'gt_bboxes_3d', 'gt_labels_3d', 'instance_inds', 'img',
-        'points', 'timestamp', 'l2g_r_mat', 'l2g_t',
-        'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels']),
+        'gt_bboxes_3d', 'gt_labels_3d', 'instance_inds',
+        'points', 'timestamp', 'l2g_r_mat', 'l2g_t']),
 ]
 
 test_pipeline = [
-    dict(type='LoadMultiViewImageFromFiles'),
-    dict(type='ResizeMultiViewKeepRatio', scale=(960, 544), keep_ratio=True),
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
@@ -266,15 +245,12 @@ test_pipeline = [
         pad_empty_sweeps=True,
         remove_close=True),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
-    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
-    dict(type='PadMultiViewImage', size_divisor=32),
 ]
 test_pipeline_post = [
     dict(type='FormatBundle3DTrack'),
     dict(type='Collect3D', keys=[
         'gt_bboxes_3d', 'gt_labels_3d',
-        'points', 'img', 'timestamp', 'l2g_r_mat', 'l2g_t',
-        'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels']),
+        'points', 'timestamp', 'l2g_r_mat', 'l2g_t']),
 ]
 
 data = dict(
@@ -293,7 +269,7 @@ data = dict(
         use_valid_flag=True,
         box_type_3d='LiDAR',
         camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'],
-        do_pred=True),
+        do_pred=False),
     val=dict(
         type=dataset_type,
         pipeline_single=test_pipeline,
@@ -303,7 +279,7 @@ data = dict(
         ann_file=data_root + 'nuscenes_tracking_infos_val.pkl',
         num_frames_per_sample=1,
         camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'],
-        do_pred=True),
+        do_pred=False),
     test=dict(
         type=dataset_type,
         pipeline_single=test_pipeline,
@@ -313,15 +289,15 @@ data = dict(
         ann_file=data_root + 'nuscenes_tracking_infos_val.pkl',
         num_frames_per_sample=1,
         camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'],
-        do_pred=True))
+        do_pred=False))
 
 optimizer = dict(
     type='AdamW',
     lr=2e-4,
     paramwise_cfg=dict(
         custom_keys={
-            'img_backbone': dict(lr_mult=0.0),  # frozen
-            'img_neck':     dict(lr_mult=0.0),  # frozen
+            'img_backbone': dict(lr_mult=0.0),
+            'img_neck':     dict(lr_mult=0.0),
             'pts_backbone': dict(lr_mult=0.1),
             'pts_neck':     dict(lr_mult=0.1),
             'heatmap_head': dict(lr_mult=0.1),
@@ -330,7 +306,6 @@ optimizer = dict(
             'hm_task2':    dict(lr_mult=0.1),
             'hm_task4':    dict(lr_mult=0.1),
             'hm_task5':    dict(lr_mult=0.1),
-            # img_bev_proj and img_hm_* use base lr (2e-4) — new modules, full lr
         }),
     weight_decay=0.01)
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
@@ -341,7 +316,6 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
 )
-
 total_epochs = 15
 evaluation = dict(interval=15)
 runner = dict(type='EpochBasedRunner', max_epochs=15)

@@ -3,6 +3,7 @@ from __future__ import division
 import argparse
 import copy
 import mmcv
+import multiprocessing as mp
 import os
 import time
 import torch
@@ -154,6 +155,9 @@ def main():
         distributed = False
     else:
         distributed = True
+        # fork like single-GPU runs: workers share the dataset instead of each unpickling a copy
+        # (init_dist would otherwise set spawn)
+        mp.set_start_method('fork', force=True)
         init_dist(args.launcher, **cfg.dist_params)
         # re-set gpu_ids with distributed training mode
         _, world_size = get_dist_info()

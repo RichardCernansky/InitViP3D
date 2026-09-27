@@ -1,16 +1,3 @@
-diff --git a/mmdet3d/__init__.py b/mmdet3d/__init__.py
-index ee89aa5..689a530 100644
---- a/mmdet3d/__init__.py
-+++ b/mmdet3d/__init__.py
-@@ -19,7 +19,7 @@ def digit_version(version_str):
- 
- 
- mmcv_minimum_version = '1.3.8'
--mmcv_maximum_version = '1.4.0'
-+mmcv_maximum_version = '1.7.2'
- mmcv_version = digit_version(mmcv.__version__)
- 
- 
 diff --git a/mmdet3d/datasets/pipelines/data_augment_utils.py b/mmdet3d/datasets/pipelines/data_augment_utils.py
 index 23b6aad..554d90c 100644
 --- a/mmdet3d/datasets/pipelines/data_augment_utils.py
@@ -25,18 +12,19 @@ index 23b6aad..554d90c 100644
  from mmdet3d.core.bbox import box_np_ops
  
 diff --git a/mmdet3d/ops/ball_query/src/ball_query.cpp b/mmdet3d/ops/ball_query/src/ball_query.cpp
-index 6e9d5f7..cbcc95e 100644
+index 6e9d5f7..c05744f 100644
 --- a/mmdet3d/ops/ball_query/src/ball_query.cpp
 +++ b/mmdet3d/ops/ball_query/src/ball_query.cpp
-@@ -1,7 +1,6 @@
+@@ -1,7 +1,7 @@
  // Modified from
  // https://github.com/sshaoshuai/Pointnet2.PyTorch/tree/master/pointnet2/src/ball_query.cpp
  
 -#include <THC/THC.h>
++#include <ATen/cuda/CUDAContext.h>
  #include <cuda.h>
  #include <cuda_runtime_api.h>
  #include <torch/extension.h>
-@@ -9,7 +8,6 @@
+@@ -9,7 +9,6 @@
  
  #include <vector>
  
@@ -45,14 +33,15 @@ index 6e9d5f7..cbcc95e 100644
  #define CHECK_CUDA(x) \
    TORCH_CHECK(x.type().is_cuda(), #x, " must be a CUDAtensor ")
 diff --git a/mmdet3d/ops/furthest_point_sample/src/furthest_point_sample.cpp b/mmdet3d/ops/furthest_point_sample/src/furthest_point_sample.cpp
-index be05890..3d79d65 100644
+index be05890..78525c8 100644
 --- a/mmdet3d/ops/furthest_point_sample/src/furthest_point_sample.cpp
 +++ b/mmdet3d/ops/furthest_point_sample/src/furthest_point_sample.cpp
-@@ -2,13 +2,11 @@
+@@ -2,13 +2,12 @@
  // https://github.com/sshaoshuai/Pointnet2.PyTorch/tree/master/pointnet2/src/sampling.cpp
  
  #include <ATen/cuda/CUDAContext.h>
 -#include <THC/THC.h>
++#include <ATen/cuda/CUDAContext.h>
  #include <torch/extension.h>
  #include <torch/serialize/tensor.h>
  
@@ -63,12 +52,13 @@ index be05890..3d79d65 100644
  int furthest_point_sampling_wrapper(int b, int n, int m,
                                      at::Tensor points_tensor,
 diff --git a/mmdet3d/ops/gather_points/src/gather_points.cpp b/mmdet3d/ops/gather_points/src/gather_points.cpp
-index 01a3e40..538817e 100644
+index 01a3e40..c15fa6c 100644
 --- a/mmdet3d/ops/gather_points/src/gather_points.cpp
 +++ b/mmdet3d/ops/gather_points/src/gather_points.cpp
-@@ -1,11 +1,9 @@
+@@ -1,11 +1,10 @@
  #include <ATen/cuda/CUDAContext.h>
 -#include <THC/THC.h>
++#include <ATen/cuda/CUDAContext.h>
  #include <torch/extension.h>
  #include <torch/serialize/tensor.h>
  
@@ -79,18 +69,19 @@ index 01a3e40..538817e 100644
  int gather_points_wrapper(int b, int c, int n, int npoints,
                            at::Tensor points_tensor, at::Tensor idx_tensor,
 diff --git a/mmdet3d/ops/group_points/src/group_points.cpp b/mmdet3d/ops/group_points/src/group_points.cpp
-index 3cd6fc8..bedc004 100644
+index 3cd6fc8..b3f8bda 100644
 --- a/mmdet3d/ops/group_points/src/group_points.cpp
 +++ b/mmdet3d/ops/group_points/src/group_points.cpp
-@@ -1,7 +1,6 @@
+@@ -1,7 +1,7 @@
  // Modified from
  // https://github.com/sshaoshuai/Pointnet2.PyTorch/tree/master/pointnet2/src/group_points.cpp
  
 -#include <THC/THC.h>
++#include <ATen/cuda/CUDAContext.h>
  #include <cuda.h>
  #include <cuda_runtime_api.h>
  #include <torch/extension.h>
-@@ -9,7 +8,6 @@
+@@ -9,7 +9,6 @@
  
  #include <vector>
  
@@ -99,18 +90,19 @@ index 3cd6fc8..bedc004 100644
  int group_points_wrapper(int b, int c, int n, int npoints, int nsample,
                           at::Tensor points_tensor, at::Tensor idx_tensor,
 diff --git a/mmdet3d/ops/interpolate/src/interpolate.cpp b/mmdet3d/ops/interpolate/src/interpolate.cpp
-index 6382579..279b406 100644
+index 6382579..4817f68 100644
 --- a/mmdet3d/ops/interpolate/src/interpolate.cpp
 +++ b/mmdet3d/ops/interpolate/src/interpolate.cpp
-@@ -1,7 +1,6 @@
+@@ -1,7 +1,7 @@
  // Modified from
  // https://github.com/sshaoshuai/Pointnet2.PyTorch/tree/master/pointnet2/src/interpolate.cpp
  
 -#include <THC/THC.h>
++#include <ATen/cuda/CUDAContext.h>
  #include <cuda.h>
  #include <cuda_runtime_api.h>
  #include <math.h>
-@@ -12,7 +11,6 @@
+@@ -12,7 +12,6 @@
  
  #include <vector>
  
@@ -119,14 +111,15 @@ index 6382579..279b406 100644
  void three_nn_wrapper(int b, int n, int m, at::Tensor unknown_tensor,
                        at::Tensor known_tensor, at::Tensor dist2_tensor,
 diff --git a/mmdet3d/ops/knn/src/knn.cpp b/mmdet3d/ops/knn/src/knn.cpp
-index 84ddf4b..e739a50 100644
+index 84ddf4b..4cb7a22 100644
 --- a/mmdet3d/ops/knn/src/knn.cpp
 +++ b/mmdet3d/ops/knn/src/knn.cpp
-@@ -3,10 +3,8 @@
+@@ -3,10 +3,9 @@
  #include <torch/serialize/tensor.h>
  #include <torch/extension.h>
  #include <vector>
 -#include <THC/THC.h>
++#include <ATen/cuda/CUDAContext.h>
  #include <ATen/cuda/CUDAContext.h>
  
 -extern THCState *state;

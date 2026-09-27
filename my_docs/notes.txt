@@ -1,11 +1,14 @@
 MIGRATION 26.9. 2026
-- migrate codebase
-- migrate work_dirs
-- migrate ckpt_init
-- put claude.md on cluster
-- set up pylance settings
+- migrate codebase - done
+- migrate work_dirs - done
+- migrate ckpt_init - done
+- put claude.md on cluster - done
+- set up pylance settings - done
 - set up mini
-- deal with the dependencies
+- move .tars to /mnt
+- deal with the dependencies - mostly done
+- create DB for augmented training
+
 
 25. 9. 2026
 Experiments To Perform

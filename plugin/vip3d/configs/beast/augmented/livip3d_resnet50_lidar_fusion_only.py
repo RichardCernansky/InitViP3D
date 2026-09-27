@@ -1,7 +1,16 @@
 _base_ = [
-    './_base_/nus-3d.py',
-    './_base_/default_runtime.py'
+    '../../_base_/nus-3d.py',
+    '../../_base_/default_runtime.py'
 ]
+# TransFusion Table 7 ablation, "w/o Guide" cell: SMCA feature fusion ON,
+# image-guided query init OFF. Stage 2 of the paper's 2-stage scheme --
+# loads directly from stage 1's (augmented/livip3d_resnet50_lidar_only.py)
+# finished checkpoint, sibling to livip3d_resnet50_lidar_img_guided.py
+# ("w/o Fusion") and livip3d_resnet50_lidar_img_guided_smca.py (full
+# model). No point-cloud geometric augmentation here, same reasoning as
+# the other two stage-2 configs: SMCA's cross attention is keyed off
+# projected query centers using calibration matrices that augmentation
+# would desync from the (unaugmented) camera images.
 workflow = [('train', 1)]
 plugin = True
 plugin_dir = 'plugin/'
@@ -16,10 +25,14 @@ class_names = [
     'car', 'truck', 'bus', 'trailer',
     'motorcycle', 'bicycle', 'pedestrian',
 ]
+prediction_eval_classes = [
+    'car', 'truck', 'bus', 'trailer',
+    'motorcycle', 'bicycle', 'pedestrian',
+]
 
 input_modality = dict(
     use_lidar=True,
-    use_camera=False,
+    use_camera=True,
     use_radar=False,
     use_map=False,
     use_external=False)
@@ -35,8 +48,8 @@ model = dict(
         pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0],
         max_num=100,
         num_classes=7),
-    fix_feats=True,
-    fix_lidar=False,
+    fix_feats=True,   # camera backbone frozen
+    fix_lidar=True,   # stage 1 LiDAR backbone already converged; only train new modules
     score_thresh=0.4,
     filter_score_thresh=0.35,
     use_lidar=True,
@@ -146,7 +159,7 @@ model = dict(
                 num_heads=8,
                 ffn_dims=512,
                 dropout=0.1,
-                use_smca=False,
+                use_smca=True,
                 lidar_bev_attn=dict(
                     type='LiDARBEVDeformCrossAtten',
                     embed_dims=256,
@@ -162,7 +175,9 @@ model = dict(
                     num_cams=6,
                     num_levels=4,
                     pc_range=point_cloud_range,
-                    dropout=0.1),
+                    dropout=0.1,
+                    sigma_scale=1.0,
+                    feat_level=0),
             )),
         pc_range=point_cloud_range,
         positional_encoding=dict(
@@ -174,11 +189,21 @@ model = dict(
     debug=False,
     bev_vis=True,
     vis_interval=20,
-    use_smca=False,
-    do_pred=False,
-    relative_pred=False,
-    agents_layer_0=False,
-    add_branch=False,
+    use_img_guided=False,
+    use_smca=True,
+    do_pred=True,
+    relative_pred=True,
+    agents_layer_0=True,
+    add_branch=True,
+    predictor=dict(
+        hidden_size=128,
+        laneGCN=True,
+        decoder=dict(
+            variety_loss=True,
+            variety_loss_prob=True,
+            hidden_size=128,
+        ),
+    ),
     train_cfg=dict(
         pts=dict(
             grid_size=[512, 512, 1],
@@ -205,6 +230,8 @@ data_root = 'data/nuscenes/'
 file_client_args = dict(backend='disk')
 
 train_pipeline = [
+    dict(type='LoadMultiViewImageFromFiles'),
+    dict(type='ResizeMultiViewKeepRatio', scale=(960, 544), keep_ratio=True),
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
@@ -221,15 +248,20 @@ train_pipeline = [
         remove_close=True),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
     dict(type='InstanceRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
+    dict(type='PadMultiViewImage', size_divisor=32),
 ]
 train_pipeline_post = [
     dict(type='FormatBundle3DTrack'),
     dict(type='Collect3D', keys=[
-        'gt_bboxes_3d', 'gt_labels_3d', 'instance_inds',
-        'points', 'timestamp', 'l2g_r_mat', 'l2g_t']),
+        'gt_bboxes_3d', 'gt_labels_3d', 'instance_inds', 'img',
+        'points', 'timestamp', 'l2g_r_mat', 'l2g_t',
+        'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels']),
 ]
 
 test_pipeline = [
+    dict(type='LoadMultiViewImageFromFiles'),
+    dict(type='ResizeMultiViewKeepRatio', scale=(960, 544), keep_ratio=True),
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
@@ -245,12 +277,15 @@ test_pipeline = [
         pad_empty_sweeps=True,
         remove_close=True),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
+    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
+    dict(type='PadMultiViewImage', size_divisor=32),
 ]
 test_pipeline_post = [
     dict(type='FormatBundle3DTrack'),
     dict(type='Collect3D', keys=[
         'gt_bboxes_3d', 'gt_labels_3d',
-        'points', 'timestamp', 'l2g_r_mat', 'l2g_t']),
+        'points', 'img', 'timestamp', 'l2g_r_mat', 'l2g_t',
+        'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels']),
 ]
 
 data = dict(
@@ -269,7 +304,7 @@ data = dict(
         use_valid_flag=True,
         box_type_3d='LiDAR',
         camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'],
-        do_pred=False),
+        do_pred=True),
     val=dict(
         type=dataset_type,
         pipeline_single=test_pipeline,
@@ -279,7 +314,7 @@ data = dict(
         ann_file=data_root + 'nuscenes_tracking_infos_val.pkl',
         num_frames_per_sample=1,
         camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'],
-        do_pred=False),
+        do_pred=True),
     test=dict(
         type=dataset_type,
         pipeline_single=test_pipeline,
@@ -289,15 +324,15 @@ data = dict(
         ann_file=data_root + 'nuscenes_tracking_infos_val.pkl',
         num_frames_per_sample=1,
         camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'],
-        do_pred=False))
+        do_pred=True))
 
 optimizer = dict(
     type='AdamW',
     lr=2e-4,
     paramwise_cfg=dict(
         custom_keys={
-            'img_backbone': dict(lr_mult=0.0),
-            'img_neck':     dict(lr_mult=0.0),
+            'img_backbone': dict(lr_mult=0.0),  # frozen
+            'img_neck':     dict(lr_mult=0.0),  # frozen
             'pts_backbone': dict(lr_mult=0.1),
             'pts_neck':     dict(lr_mult=0.1),
             'heatmap_head': dict(lr_mult=0.1),
@@ -306,6 +341,7 @@ optimizer = dict(
             'hm_task2':    dict(lr_mult=0.1),
             'hm_task4':    dict(lr_mult=0.1),
             'hm_task5':    dict(lr_mult=0.1),
+            # smca_attn and other new fusion modules use base lr (2e-4)
         }),
     weight_decay=0.01)
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
@@ -316,10 +352,11 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
 )
-total_epochs = 15
-evaluation = dict(interval=15)
-runner = dict(type='EpochBasedRunner', max_epochs=15)
+
+total_epochs = 6
+evaluation = dict(interval=6)
+runner = dict(type='EpochBasedRunner', max_epochs=6)
 
 find_unused_parameters = True
-load_from = 'ckpt_init/livip3d_init.pth'
+load_from = 'work_dirs/s1-livip3d_lidar_only_augmented/epoch_20.pth'
 # fp16 = dict(loss_scale='dynamic')
