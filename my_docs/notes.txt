@@ -9,16 +9,17 @@ MIGRATION 26.9. 2026
 - deal with the dependencies - mostly done
 - create DB for augmented training
 
+- check how batches are now processed in the backbones - done I guess
+- check l0, l1 architectures in detail 
+- check for initialization of point Pillars backbone what is wrong
+- update the configs with the new loss
+- lanes are augmented as well
 
 25. 9. 2026
 Experiments To Perform
 1. non-augmented lidar-only -> smca on beast
 2. augmented lidar+image pretrain -> smca on beast
 3. all on Perun
-- check l0, l1 architectures in detail
-- update the configs with the new loss
-- lanes are augmented as well
-- check for initialization of poinPillars backbone what is wrong
 
 
 //add visualizations for top-k query in both BEV and camera to see the correctness of gaussian blobs

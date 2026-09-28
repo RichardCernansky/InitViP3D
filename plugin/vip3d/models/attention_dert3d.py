@@ -710,7 +710,7 @@ class LiDARBEVDeformCrossAtten(BaseModule):
         _, C_bev, H_bev, W_bev = bev_feat.shape
         # [B, C_bev, H, W] → [B, H*W, embed_dims]
         bev_flat = bev_feat.flatten(2).permute(0, 2, 1)          # [B, H*W, C_bev]
-        bev_flat = self.bev_proj(bev_flat)                        # [B, H*W, D]
+        bev_flat = self.bev_proj(bev_flat)                        # [B, H*W, D=embed_dims]
 
         # ── predict per-query sampling offsets and weights ─────────────────────
         q_b = query.permute(1, 0, 2)  # [B, num_q, D]
