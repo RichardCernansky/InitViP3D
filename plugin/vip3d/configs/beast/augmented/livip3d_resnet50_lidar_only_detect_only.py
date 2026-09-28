@@ -320,8 +320,13 @@ test_pipeline_post = [
         'points', 'timestamp', 'l2g_r_mat', 'l2g_t']),
 ]
 
+# Clips per GPU. The backbones run batched over them; tracking and prediction
+# run clip by clip and the losses are averaged (ViP3D.forward_train). The LR
+# is not rescaled with it.
+samples_per_gpu = 1
+
 data = dict(
-    samples_per_gpu=1,
+    samples_per_gpu=samples_per_gpu,
     workers_per_gpu=4,
     train=dict(
         type='CBGSDataset',
