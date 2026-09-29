@@ -1,6 +1,7 @@
 _base_ = [
     '../../_base_/nus-3d.py',
-    '../../_base_/default_runtime.py'
+    '../../_base_/default_runtime.py',
+    '../../_base_/heatmap_tasks.py',
 ]
 workflow = [('train', 1)]
 plugin = True
@@ -48,6 +49,12 @@ model = dict(
     lidar_bev_channels=384,
     lidar_voxel_size=[0.2, 0.2, 8],
     lidar_out_size_factor=2,
+    heatmap_head=dict(
+        type='LiViPHeatmapHead',
+        in_channels=384,
+        hidden_channels=64,
+        class_names=class_names,
+        tasks={{_base_.centerpoint_nusc_tasks}}),
     pts_voxel_layer=dict(
         max_num_points=20,
         voxel_size=[0.2, 0.2, 8],
@@ -323,18 +330,13 @@ optimizer = dict(
             'pts_backbone': dict(lr_mult=0.1),
             'pts_neck':     dict(lr_mult=0.1),
             'heatmap_head': dict(lr_mult=0.1),
-            'hm_task0':    dict(lr_mult=0.1),
-            'hm_task1':    dict(lr_mult=0.1),
-            'hm_task2':    dict(lr_mult=0.1),
-            'hm_task4':    dict(lr_mult=0.1),
-            'hm_task5':    dict(lr_mult=0.1),
         }),
     weight_decay=0.01)
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
 lr_config = dict(
     policy='CosineAnnealing',
     warmup='linear',
-    warmup_iters=500,
+    warmup_iters=150,
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
 )
@@ -343,5 +345,7 @@ evaluation = dict(interval=20)
 runner = dict(type='EpochBasedRunner', max_epochs=20)
 
 find_unused_parameters = True
-load_from = 'ckpt_init/livip3d_init.pth'
+# Only the image backbone/neck are pretrained (DETR3D); the LiDAR path and
+# the heatmap head train from scratch, as in TransFusion's first stage.
+load_from = 'ckpt_init/detr3d_resnet50.pth'
 # fp16 = dict(loss_scale='dynamic')

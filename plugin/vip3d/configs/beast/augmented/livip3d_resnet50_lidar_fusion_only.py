@@ -1,6 +1,7 @@
 _base_ = [
     '../../_base_/nus-3d.py',
-    '../../_base_/default_runtime.py'
+    '../../_base_/default_runtime.py',
+    '../../_base_/heatmap_tasks.py',
 ]
 # TransFusion Table 7 ablation, "w/o Guide" cell: SMCA feature fusion ON,
 # image-guided query init OFF. Stage 2 of the paper's 2-stage scheme --
@@ -56,6 +57,12 @@ model = dict(
     lidar_bev_channels=384,
     lidar_voxel_size=[0.2, 0.2, 8],
     lidar_out_size_factor=2,
+    heatmap_head=dict(
+        type='LiViPHeatmapHead',
+        in_channels=384,
+        hidden_channels=64,
+        class_names=class_names,
+        tasks={{_base_.centerpoint_nusc_tasks}}),
     pts_voxel_layer=dict(
         max_num_points=20,
         voxel_size=[0.2, 0.2, 8],
@@ -341,11 +348,6 @@ optimizer = dict(
             'pts_backbone': dict(lr_mult=0.1),
             'pts_neck':     dict(lr_mult=0.1),
             'heatmap_head': dict(lr_mult=0.1),
-            'hm_task0':    dict(lr_mult=0.1),
-            'hm_task1':    dict(lr_mult=0.1),
-            'hm_task2':    dict(lr_mult=0.1),
-            'hm_task4':    dict(lr_mult=0.1),
-            'hm_task5':    dict(lr_mult=0.1),
             # smca_attn and other new fusion modules use base lr (2e-4)
         }),
     weight_decay=0.01)

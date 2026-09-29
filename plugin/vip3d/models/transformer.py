@@ -432,12 +432,14 @@ class TransFusionTransformerDecoder(BaseModule):
         q = query
         # self-attention
         q2, _ = self.sa0(q + query_pos, q + query_pos, q)
+        # add and norm
         q = self.n0[0](q + q2)
         # LiDAR BEV cross-attention
         q2 = self.ca0(q, query_pos=query_pos, bev_feat=bev_feat,
                       reference_points=reference_points, **kwargs)
+        # add and norm
         q = self.n0[1](q + q2)
-        # FFN
+        # FFN & add and norm
         q = self.n0[2](q + self.ff0(q.permute(1, 0, 2)).permute(1, 0, 2))
 
         if reg_branches is not None:
@@ -461,15 +463,19 @@ class TransFusionTransformerDecoder(BaseModule):
                     torch.stack(inter_ref),
                     torch.stack(inter_size))
 
+        # clone
         q_layer0 = q.clone()  # pure layer 0 output, before layer 1
-
+        # self-attention (multihead)
         q2, _ = self.sa1(q + query_pos, q + query_pos, q)
+        # add and norm
         q = self.n1[0](q + q2)
-
+        # SMCA cross-attention
         ca1_out, no_cam_mask = self.ca1(q, value=value, query_pos=query_pos,
                                         reference_points=reference_points,
                                         ref_size=ref_size, **kwargs)
+        # add and norm
         q = self.n1[1](q + ca1_out)
+        # FFN & add and norm
         q = self.n1[2](q + self.ff1(q.permute(1, 0, 2)).permute(1, 0, 2))
 
         # invisible queries → fall back to pure layer 0 output

@@ -18,9 +18,10 @@ import torch.nn.functional as F
 
 from mmdet3d.core.bbox.coders import build_bbox_coder
 from ...mmdet3d_plugin.core.bbox.util import normalize_bbox, denormalize_bbox
+from mmdet3d.models.builder import build_fusion_layer, build_head
 from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
 from ...mmdet3d_plugin.models.utils.grid_mask import GridMask
-from .attention_dert3d import inverse_sigmoid, ImageGuidedBEVProjection
+from .attention_dert3d import inverse_sigmoid
 from . import predictor_lib
 from .memory_bank import build_memory_bank
 from .qim import build_qim
@@ -95,6 +96,12 @@ class ViP3D(MVXTwoStageDetector):
                 lidar_bev_channels=256,
                 lidar_voxel_size=None,
                 lidar_out_size_factor=4,
+                heatmap_head=None,
+                # Named so it does not contain 'heatmap_head': the optimizer's
+                # custom_keys match on substrings, and 'heatmap_head' must not
+                # also catch the image-guided head.
+                img_hm_head=None,
+                img_bev_proj=None,
                 heatmap_score_thresh=0.1, # not in the configs yet, but used in the code
                 debug=False,
                 bev_vis=True,
@@ -196,60 +203,18 @@ class ViP3D(MVXTwoStageDetector):
             self.lidar_voxel_size = lidar_voxel_size 
             self.lidar_out_size_factor = lidar_out_size_factor
             self.category_embeds = nn.Embedding(num_classes, embed_dims)
-            # heatmap_head: shared_conv (384→64, 3×3+BN+ReLU), pretrained from dense_head.shared_conv
-            self.heatmap_head = nn.Sequential(
-                nn.Conv2d(lidar_bev_channels, 64, 3, padding=1),
-                nn.BatchNorm2d(64),
-                nn.ReLU(inplace=True),
-            )
-            # Per-task heatmap heads loaded directly from CenterPoint — no merging, no adaptation.
-            # task layout: 0=car(1), 1=truck+cveh(2), 2=bus+trailer(2), 4=moto+bike(2), 5=ped+cone(2)
-            def _task_head(n_cls):
-                return nn.Sequential(
-                    nn.Conv2d(64, 64, 3, padding=1),
-                    nn.BatchNorm2d(64),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(64, n_cls, 3, padding=1),
-                )
-            self.hm_task0 = _task_head(1)   # car
-            self.hm_task1 = _task_head(2)   # truck, cveh
-            self.hm_task2 = _task_head(2)   # bus, trailer
-            self.hm_task4 = _task_head(2)   # motorcycle, bicycle
-            self.hm_task5 = _task_head(2)   # pedestrian, traffic_cone
-            # Which (head, channel) supplies each of this model's 7 classes, in
-            # class order. _assemble_heatmap drives both the LiDAR heads above
-            # and the img_-prefixed ones below off this one table; the classes
-            # this model drops (cveh, traffic_cone) are simply never listed.
-            self._hm_layout = (
-                ('hm_task0', 0),   # car
-                ('hm_task1', 0),   # truck
-                ('hm_task2', 0),   # bus
-                ('hm_task2', 1),   # trailer
-                ('hm_task4', 0),   # motorcycle
-                ('hm_task4', 1),   # bicycle
-                ('hm_task5', 0),   # pedestrian
-            )
+            # LiViPHeatmapHead: BEV features -> [B, num_classes, H, W] logits.
+            self.heatmap_head = build_head(heatmap_head)
             # Projects BEV channels → embed_dims for query content vector
             self.lidar_bev_proj = nn.Linear(lidar_bev_channels, embed_dims)
 
             self.use_img_guided = use_img_guided
             if self.use_img_guided:
-                self.img_bev_proj = ImageGuidedBEVProjection(
-                    bev_channels=lidar_bev_channels,
-                    img_channels=256,
-                    embed_dims=embed_dims,
-                    num_cams=pts_bbox_head.get('num_cams', 6) if pts_bbox_head else 6,
-                )
-                self.img_hm_head = nn.Sequential(
-                    nn.Conv2d(lidar_bev_channels, 64, 3, padding=1),
-                    nn.BatchNorm2d(64),
-                    nn.ReLU(inplace=True),
-                )
-                self.img_hm_task0 = _task_head(1)   # car
-                self.img_hm_task1 = _task_head(2)   # truck, cveh
-                self.img_hm_task2 = _task_head(2)   # bus, trailer
-                self.img_hm_task4 = _task_head(2)   # motorcycle, bicycle
-                self.img_hm_task5 = _task_head(2)   # pedestrian, traffic_cone
+                self.img_bev_proj = build_fusion_layer(img_bev_proj)
+                # Second heatmap over the image-guided BEV map; same head, its
+                # own weights. Defaults to the LiDAR head's config.
+                self.img_hm_head = build_head(
+                    heatmap_head if img_hm_head is None else img_hm_head)
 
         self.track_base = RuntimeTrackerBase(
             score_thresh=score_thresh,
@@ -514,24 +479,6 @@ class ViP3D(MVXTwoStageDetector):
                 self.predictor.decoder.do_eval = True
             return self.forward_test(**kwargs)
 
-    def _assemble_heatmap(self, shared, prefix=''):
-        """Regroup CenterPoint's task heads into this model's class order.
-
-        `prefix=''` runs the LiDAR heads, `prefix='img_'` the image-guided
-        ones -- they share a layout, only the modules differ. Each head is
-        evaluated once and then sliced, since several classes come from the
-        same head (bus and trailer both live in hm_task2).
-
-        Returns: [B, 7, H, W], pre-sigmoid logits in class order.
-        """
-        run = {}
-        channels = []
-        for name, c in self._hm_layout:
-            if name not in run:
-                run[name] = getattr(self, prefix + name)(shared)
-            channels.append(run[name][:, c:c + 1])
-        return torch.cat(channels, dim=1)
-
     def _compute_heatmap(self, bev_feat, img_feats):
         """BEV features -> (class heatmap, features the queries are read from).
 
@@ -539,12 +486,12 @@ class ViP3D(MVXTwoStageDetector):
         queries are read from the image-guided projection instead of the raw
         BEV, which is why both come back together.
         """
-        heatmap = self._assemble_heatmap(self.heatmap_head(bev_feat))
+        heatmap = self.heatmap_head(bev_feat)
         feat_for_queries = bev_feat
 
         if self.use_img_guided and img_feats is not None:
             F_LC = self.img_bev_proj(bev_feat, img_feats)
-            img_heatmap = self._assemble_heatmap(self.img_hm_head(F_LC), prefix='img_')
+            img_heatmap = self.img_hm_head(F_LC)
             heatmap = (heatmap + img_heatmap) * 0.5
             feat_for_queries = F_LC
 
@@ -634,11 +581,6 @@ class ViP3D(MVXTwoStageDetector):
             no need to call velo update
         '''
         # l2g_r2 is rotation matrix of next frame
-
-        if self.use_lidar and not hasattr(self, '_heatmap_verified'):
-            self._heatmap_verified = True
-            print(f'[verify] heatmap_head[0].weight.sum()={self.heatmap_head[0].weight.data.sum().item():.3f} (expected -2340.769)')
-            print(f'[verify] hm_task0[-1].bias={self.hm_task0[-1].bias.data.tolist()} (expected [-0.375])')
 
         if True:
             # backbone outputs for this frame, computed batched in forward_train

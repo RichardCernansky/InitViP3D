@@ -10,7 +10,7 @@ MIGRATION 26.9. 2026
 - create DB for augmented training
 
 - check how batches are now processed in the backbones - done I guess
-- check l0, l1 architectures in detail 
+- check l0, l1 architectures in detail - done I guess
 - check for initialization of point Pillars backbone what is wrong
 - update the configs with the new loss
 - lanes are augmented as well
