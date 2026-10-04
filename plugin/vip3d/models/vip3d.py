@@ -103,6 +103,10 @@ class ViP3D(MVXTwoStageDetector):
                 img_hm_head=None,
                 img_bev_proj=None,
                 heatmap_score_thresh=0.1, # not in the configs yet, but used in the code
+                # Inference-only: fold the heatmap confidence at each track's
+                # position into its score. None (default) keeps the decoder's
+                # class score alone; 'geometric' is TransFusion's rule.
+                score_fusion=None,
                 debug=False,
                 bev_vis=True,
                 vis_interval=20,
@@ -187,6 +191,8 @@ class ViP3D(MVXTwoStageDetector):
 
         self.use_lidar = use_lidar
         self.heatmap_score_thresh = heatmap_score_thresh
+        assert score_fusion in (None, 'geometric', 'arithmetic'), score_fusion
+        self.score_fusion = score_fusion
         if fix_lidar and self.use_lidar:
             for m in [self.pts_voxel_encoder, self.pts_middle_encoder,
                       self.pts_backbone, self.pts_neck]:
@@ -1135,16 +1141,20 @@ class ViP3D(MVXTwoStageDetector):
         track_scores = output_classes[-1, 0, :].sigmoid().max(dim=-1).values
         # track_scores = output_classes[-1, 0, :, 0].sigmoid()
 
-        # Blend decoder score with heatmap confidence at each track's position.
-        # TP tracks sit on strong heatmap peaks → blended score rises above 0.5 → persist.
-        # FP tracks sit on noise → blended score drops below filter_score_thresh → die quickly.
-        # if bev_feat is not None:
+        # Blend the decoder score with the heatmap confidence at each track's
+        # position (TransFusion, "Testing"). A true positive sits on a heatmap
+        # peak so its score barely moves; a false positive sits on cold heatmap
+        # and drops below filter_score_thresh, so the track dies. Inference
+        # only -- the two heads are supervised separately during training.
+        # if self.score_fusion is not None and bev_feat is not None:
         #     ref_norm = last_ref_pts[0].sigmoid()                        # [N, 3] in [0,1]
         #     H, W = heatmap.shape[2], heatmap.shape[3]
         #     col = (ref_norm[:, 0] * W).long().clamp(0, W - 1)
         #     row = (ref_norm[:, 1] * H).long().clamp(0, H - 1)
+        #     # max over classes, to match how track_scores is taken above
         #     hm_at_track = heatmap[0].sigmoid()[:, row, col].max(dim=0).values  # [N]
-        #     track_scores = 0.5 * track_scores + 0.5 * hm_at_track
+        #     if self.score_fusion == 'geometric':
+        #         track_scores = (track_scores * hm_at_track).clamp(min=0).sqrt()
 
         # Step-1 Update track instances with current prediction
         # [nb_dec, bs, num_query, xxx]

@@ -25,14 +25,14 @@ set -euo pipefail
 REPO=${SLURM_SUBMIT_DIR:-$(pwd)}
 cd "$REPO"
 
-CONFIG=${CONFIG:-plugin/vip3d/configs/perun/non-augmented/livip3d_resnet50_lidar_only.py}
-WORK_DIR=${WORK_DIR:-work_dirs/perun/non-augmented/s1_lidar_only_g8_b8}
+CONFIG=${CONFIG:-plugin/vip3d/configs/perun/non-augmented/livip3d_resnet50_lidar_img_guided.py}
+WORK_DIR=${WORK_DIR:-work_dirs/perun/non-augmented/joint_img_guided_necktrain_b16}
 GPUS=${GPUS:-8}
-BATCH=${BATCH:-8}              # clips per GPU; effective batch = GPUS * BATCH
+BATCH=${BATCH:-2}              # clips per GPU; effective batch = GPUS * BATCH
 KEEP_CKPTS=${KEEP_CKPTS:--1}   # -1 = keep every epoch (20 x 231 MB on a 500 GB home)
 RESUME=${RESUME:-}             # checkpoint to continue from; empty = start fresh
 
-source env/activate.sh
+source env/requirements/activate.sh
 
 # dist_train.sh defaults to 29401; randomise so two jobs on one node don't clash
 export PORT=${PORT:-$((29400 + RANDOM % 500))}

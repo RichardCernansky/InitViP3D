@@ -17,7 +17,6 @@ class_names = [
     'car', 'truck', 'bus', 'trailer',
     'motorcycle', 'bicycle', 'pedestrian',
 ]
-# prediction_eval_classes = ['car', 'pedestrian'] 
 prediction_eval_classes = [
     'car', 'truck', 'bus', 'trailer',
     'motorcycle', 'bicycle', 'pedestrian',
@@ -25,7 +24,7 @@ prediction_eval_classes = [
 
 input_modality = dict(
     use_lidar=True,
-    use_camera=False,
+    use_camera=True,
     use_radar=False,
     use_map=False,
     use_external=False)
@@ -41,7 +40,9 @@ model = dict(
         pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0],
         max_num=100,
         num_classes=7),
-    fix_feats=True,   # frozen — no camera gradients, saves ~4GB activation memory
+    # fix_feats would no_grad the whole image path, neck included. Freeze the
+    # backbone through frozen_stages=4 instead, so the FPN can still adapt.
+    fix_feats=False,
     fix_lidar=False,
     score_thresh=0.4,
     filter_score_thresh=0.35,
@@ -55,6 +56,14 @@ model = dict(
         hidden_channels=64,
         class_names=class_names,
         tasks={{_base_.centerpoint_nusc_tasks}}),
+    img_bev_proj=dict(
+        type='ImageGuidedBEVProjection',
+        bev_channels=384,
+        img_channels=256,
+        embed_dims=256,
+        num_heads=8,
+        num_cams=6,
+        feat_level=0),
     pts_voxel_layer=dict(
         max_num_points=20,
         voxel_size=[0.2, 0.2, 8],
@@ -103,7 +112,7 @@ model = dict(
         depth=50,
         num_stages=4,
         out_indices=(0, 1, 2, 3),
-        frozen_stages=1,
+        frozen_stages=4,   # whole backbone frozen (stop grad + eval)
         norm_cfg=dict(type='BN2d', requires_grad=False),
         norm_eval=True,
         style='caffe',
@@ -186,7 +195,7 @@ model = dict(
     debug=False,
     bev_vis=True,
     vis_interval=20,
-    use_img_guided=False,
+    use_img_guided=True,
     use_smca=False,
     do_pred=True,
     relative_pred=True,
@@ -227,6 +236,8 @@ data_root = 'data/nuscenes/'
 file_client_args = dict(backend='disk')
 
 train_pipeline = [
+    dict(type='LoadMultiViewImageFromFiles'),
+    dict(type='ResizeMultiViewKeepRatio', scale=(960, 544), keep_ratio=True),
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
@@ -243,16 +254,20 @@ train_pipeline = [
         remove_close=True),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
     dict(type='InstanceRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
+    dict(type='PadMultiViewImage', size_divisor=32),
 ]
 train_pipeline_post = [
     dict(type='FormatBundle3DTrack'),
     dict(type='Collect3D', keys=[
-        'gt_bboxes_3d', 'gt_labels_3d', 'instance_inds',
+        'gt_bboxes_3d', 'gt_labels_3d', 'instance_inds', 'img',
         'points', 'timestamp', 'l2g_r_mat', 'l2g_t',
         'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels']),
 ]
 
 test_pipeline = [
+    dict(type='LoadMultiViewImageFromFiles'),
+    dict(type='ResizeMultiViewKeepRatio', scale=(960, 544), keep_ratio=True),
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
@@ -268,12 +283,14 @@ test_pipeline = [
         pad_empty_sweeps=True,
         remove_close=True),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
+    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
+    dict(type='PadMultiViewImage', size_divisor=32),
 ]
 test_pipeline_post = [
     dict(type='FormatBundle3DTrack'),
     dict(type='Collect3D', keys=[
         'gt_bboxes_3d', 'gt_labels_3d',
-        'points', 'timestamp', 'l2g_r_mat', 'l2g_t',
+        'points', 'img', 'timestamp', 'l2g_r_mat', 'l2g_t',
         'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels']),
 ]
 
@@ -322,29 +339,29 @@ data = dict(
 
 optimizer = dict(
     type='AdamW',
-    lr=5e-4,   # sqrt-scaled from 1e-3 at batch 64
+    lr=5e-4,
     paramwise_cfg=dict(
         custom_keys={
-            'img_backbone': dict(lr_mult=0.0),  # frozen, no update needed
-            'img_neck':     dict(lr_mult=0.0),  # frozen
-            # Training from scratch, like Transfusion's first stage
-            # 'pts_backbone': dict(lr_mult=0.1),
-            # 'pts_neck':     dict(lr_mult=0.1),
-            # 'heatmap_head': dict(lr_mult=0.1),
+            'img_backbone': dict(lr_mult=0.0),          # frozen via frozen_stages=4
+            'img_neck':     dict(lr_mult=0.1),          # pretrained DETR3D FPN
+            # fpn_convs.3 cannot load from DETR3D (add_extra_convs='on_input'
+            # makes it 2048->256, the checkpoint has 256->256), so it starts
+            # random and needs the full rate. Longest custom_key wins in mmcv.
+            'img_neck.fpn_convs.3': dict(lr_mult=1.0),
+            # img_bev_proj and img_hm_* use base lr (2e-4) — new modules, full lr
         }),
     weight_decay=0.01)
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
 lr_config = dict(
     policy='CosineAnnealing',
     warmup='linear',
-    warmup_iters=350,   # ~1% of the 35k steps at batch 16
+    warmup_iters=300,
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
 )
-total_epochs = 20 
-# in-training DistEvalHook crashes on mmcv 1.7.2 + torch 2.1; the real
-# evaluation is env/eval_epochs.sbatch
-evaluation = dict(interval=99999)
+
+total_epochs = 20  
+evaluation = dict(interval=9999)
 runner = dict(type='EpochBasedRunner', max_epochs=20)
 
 find_unused_parameters = True

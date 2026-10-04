@@ -1,3 +1,12 @@
+batch_size
+backbone training benefit?
+img_neck must train
+!img_guided init does not work
+jedna vrstva sa z vip3d inicializuje nahodne - treba 'img_neck.fpn_convs.3': dict(lr_mult=1.0),
+ask about gemetric vs. none
+
+does it come to a different valley with larger batch_size?
+
 MIGRATION 26.9. 2026
 - migrate codebase - done
 - migrate work_dirs - done
@@ -14,6 +23,7 @@ MIGRATION 26.9. 2026
 - check for initialization of point Pillars backbone what is wrong
 - update the configs with the new loss
 - lanes are augmented as well
+
 
 25. 9. 2026
 Experiments To Perform

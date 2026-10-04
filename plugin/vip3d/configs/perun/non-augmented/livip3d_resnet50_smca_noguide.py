@@ -1,3 +1,11 @@
+# LiViP3D stage 2, ablation: LiDAR-camera fusion (SMCA) WITHOUT the
+# image-guided query initialisation -- TransFusion's "w/o Guide" row
+# (Table 7: fusion +4.8 mAP, guide +1.6 mAP).
+#
+# Queries are still initialised from the stage-1 LiDAR heatmap, so the
+# only new module is the SMCA layer (331k params, residual). Everything
+# else matches livip3d_resnet50_lidar_img_guided_smca.py so the two runs
+# are directly comparable.
 _base_ = [
     '../../_base_/nus-3d.py',
     '../../_base_/default_runtime.py',
@@ -17,7 +25,6 @@ class_names = [
     'car', 'truck', 'bus', 'trailer',
     'motorcycle', 'bicycle', 'pedestrian',
 ]
-# prediction_eval_classes = ['car', 'pedestrian'] 
 prediction_eval_classes = [
     'car', 'truck', 'bus', 'trailer',
     'motorcycle', 'bicycle', 'pedestrian',
@@ -25,7 +32,7 @@ prediction_eval_classes = [
 
 input_modality = dict(
     use_lidar=True,
-    use_camera=False,
+    use_camera=True,
     use_radar=False,
     use_map=False,
     use_external=False)
@@ -41,8 +48,10 @@ model = dict(
         pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0],
         max_num=100,
         num_classes=7),
-    fix_feats=True,   # frozen — no camera gradients, saves ~4GB activation memory
-    fix_lidar=False,
+    # fix_feats would no_grad the whole image path, neck included. Freeze the
+    # backbone via frozen_stages=4 instead, so the FPN can still adapt.
+    fix_feats=False,
+    fix_lidar=True,
     score_thresh=0.4,
     filter_score_thresh=0.35,
     use_lidar=True,
@@ -103,7 +112,7 @@ model = dict(
         depth=50,
         num_stages=4,
         out_indices=(0, 1, 2, 3),
-        frozen_stages=1,
+        frozen_stages=1,   # stem + layer1 frozen; layer2-4 adapt (as in ViP3D)
         norm_cfg=dict(type='BN2d', requires_grad=False),
         norm_eval=True,
         style='caffe',
@@ -158,7 +167,7 @@ model = dict(
                 num_heads=8,
                 ffn_dims=512,
                 dropout=0.1,
-                use_smca=False,
+                use_smca=True,
                 lidar_bev_attn=dict(
                     type='LiDARBEVDeformCrossAtten',
                     embed_dims=256,
@@ -174,7 +183,9 @@ model = dict(
                     num_cams=6,
                     num_levels=4,
                     pc_range=point_cloud_range,
-                    dropout=0.1),
+                    dropout=0.1,
+                    sigma_scale=1.0,
+                    feat_level=0),
             )),
         pc_range=point_cloud_range,
         positional_encoding=dict(
@@ -183,11 +194,11 @@ model = dict(
             normalize=True,
             offset=-0.5),
     ),
-    debug=False,
+    debug=True,
     bev_vis=True,
     vis_interval=20,
-    use_img_guided=False,
-    use_smca=False,
+    use_img_guided=False,  # ablation: SMCA fusion only
+    use_smca=True,
     do_pred=True,
     relative_pred=True,
     agents_layer_0=True,
@@ -227,6 +238,8 @@ data_root = 'data/nuscenes/'
 file_client_args = dict(backend='disk')
 
 train_pipeline = [
+    dict(type='LoadMultiViewImageFromFiles'),
+    dict(type='ResizeMultiViewKeepRatio', scale=(960, 544), keep_ratio=True),
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
@@ -243,16 +256,20 @@ train_pipeline = [
         remove_close=True),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
     dict(type='InstanceRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
+    dict(type='PadMultiViewImage', size_divisor=32),
 ]
 train_pipeline_post = [
     dict(type='FormatBundle3DTrack'),
     dict(type='Collect3D', keys=[
-        'gt_bboxes_3d', 'gt_labels_3d', 'instance_inds',
+        'gt_bboxes_3d', 'gt_labels_3d', 'instance_inds', 'img',
         'points', 'timestamp', 'l2g_r_mat', 'l2g_t',
         'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels']),
 ]
 
 test_pipeline = [
+    dict(type='LoadMultiViewImageFromFiles'),
+    dict(type='ResizeMultiViewKeepRatio', scale=(960, 544), keep_ratio=True),
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
@@ -268,19 +285,21 @@ test_pipeline = [
         pad_empty_sweeps=True,
         remove_close=True),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
+    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
+    dict(type='PadMultiViewImage', size_divisor=32),
 ]
 test_pipeline_post = [
     dict(type='FormatBundle3DTrack'),
     dict(type='Collect3D', keys=[
         'gt_bboxes_3d', 'gt_labels_3d',
-        'points', 'timestamp', 'l2g_r_mat', 'l2g_t',
+        'points', 'img', 'timestamp', 'l2g_r_mat', 'l2g_t',
         'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels']),
 ]
 
 # Clips per GPU. The backbones run batched over them; tracking and prediction
 # run clip by clip and the losses are averaged (ViP3D.forward_train). The LR
 # is not rescaled with it.
-samples_per_gpu = 2 
+samples_per_gpu = 2   # 8 GPUs -> effective batch 16, 1758 iters/epoch
 
 data = dict(
     samples_per_gpu=samples_per_gpu,
@@ -325,30 +344,34 @@ optimizer = dict(
     lr=5e-4,   # sqrt-scaled from 1e-3 at batch 64
     paramwise_cfg=dict(
         custom_keys={
-            'img_backbone': dict(lr_mult=0.0),  # frozen, no update needed
-            'img_neck':     dict(lr_mult=0.0),  # frozen
-            # Training from scratch, like Transfusion's first stage
-            # 'pts_backbone': dict(lr_mult=0.1),
-            # 'pts_neck':     dict(lr_mult=0.1),
-            # 'heatmap_head': dict(lr_mult=0.1),
+            'img_backbone': dict(lr_mult=0.1),          # -> 5e-5, DETR3D weights adapt
+            'img_neck':     dict(lr_mult=0.1),          # pretrained DETR3D FPN
+            # fpn_convs.3 can't load from DETR3D (add_extra_convs='on_input'),
+            # so it starts random and needs the full rate. Longest key wins.
+            'img_neck.fpn_convs.3': dict(lr_mult=1.0),
+            # pts_voxel_encoder / pts_backbone / pts_neck need no entry: the
+            # model's fix_lidar=True already sets requires_grad=False on them.
+            'heatmap_head': dict(lr_mult=0.1),  # trained in stage 1, fine-tune
+            # img_bev_proj and img_hm_head are new here and use the base lr.
         }),
     weight_decay=0.01)
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
 lr_config = dict(
     policy='CosineAnnealing',
     warmup='linear',
-    warmup_iters=350,   # ~1% of the 35k steps at batch 16
+    warmup_iters=180,   # ~1.7% of the 10.5k steps in 6 epochs at batch 16
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
 )
-total_epochs = 20 
-# in-training DistEvalHook crashes on mmcv 1.7.2 + torch 2.1; the real
-# evaluation is env/eval_epochs.sbatch
+
+total_epochs = 6   # TransFusion's stage 2 length
+# in-training DistEvalHook crashes on mmcv 1.7.2 + torch 2.1
 evaluation = dict(interval=99999)
-runner = dict(type='EpochBasedRunner', max_epochs=20)
+runner = dict(type='EpochBasedRunner', max_epochs=6)
 
 find_unused_parameters = True
-# Only the image backbone/neck are pretrained (DETR3D); the LiDAR path and
-# the heatmap head train from scratch, as in TransFusion's first stage.
-load_from = 'ckpt_init/detr3d_resnet50.pth'
+# Stage 1 (LiDAR-only, 20 epochs). Carries the frozen DETR3D image backbone
+# and neck too, so nothing else needs loading. img_bev_proj, img_hm_head and
+# the SMCA layer are new here and start from their init.
+load_from = 'work_dirs/perun/non-augmented/s1_lidar_only_b16/epoch_20.pth'
 # fp16 = dict(loss_scale='dynamic')
