@@ -3,68 +3,110 @@
 #SBATCH --partition=gpu_short
 #SBATCH --account=perun26012552
 #SBATCH --qos=perun26012552
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
-#SBATCH --time=04:00:00
-#SBATCH --array=3-8%6
-#SBATCH --output=env/logs/eval_%A_%a.out
+#SBATCH --gres=gpu:8
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=256G
+#SBATCH --time=06:00:00
+#SBATCH --output=env/logs/eval_%j.out
 #
-# Evaluate one checkpoint per array task: detection/tracking (tools/test.py
-# --eval bbox) then trajectory prediction (tools/prediction_eval.py).
-# Submit from the repo root:   sbatch env/eval_epochs.sbatch
+# Evaluate several checkpoints on ONE node, one per GPU in parallel:
+# detection/tracking (tools/test.py --eval bbox) then trajectory prediction
+# (tools/prediction_eval.py). Submit from the repo root.
 #
-# The array index IS the epoch number, so 10-20 covers epoch_10..epoch_20 and
-# %6 caps how many run at once. Override the range on the command line:
-#   sbatch --array=20 env/eval_epochs.sbatch            # just the last one
-#   WORK_DIR=... sbatch --array=1-20%8 env/eval_epochs.sbatch
+# One node allocation covers the whole sweep -- the account limit is 4 nodes,
+# so an array job with one task per epoch would eat all of it.
+#
+#   WORK_DIR=work_dirs/.../s2_img_guided_b16 sbatch env/eval_epochs.sbatch
+#   WORK_DIR=... EPOCHS="3 4 5 6" sbatch env/eval_epochs.sbatch
+#   WORK_DIR=... EXTRA="model.score_fusion=geometric" TAG=_geom sbatch env/eval_epochs.sbatch
+#
+# More epochs than GPUs is fine: they wrap around and share one, which an eval
+# at batch 1 has plenty of memory for.
 set -euo pipefail
 
 REPO=${SLURM_SUBMIT_DIR:-$(pwd)}
 cd "$REPO"
 
-CONFIG=${CONFIG:-work_dirs/perun/non-augmented/joint_img_guided_b16/livip3d_resnet50_lidar_img_guided.py}
-WORK_DIR=${WORK_DIR:-work_dirs/perun/non-augmented/joint_img_guided_b16}
-# The config dumped into the work dir, so eval matches exactly what was trained
-# (including any --cfg-options the training job passed).
+WORK_DIR=${WORK_DIR:-work_dirs/perun/non-augmented/s2_img_guided_b16}
+# Default to the config mmdet dumped into the work dir, so the model matches
+# the weights even if the source config is edited later.
+CONFIG=${CONFIG:-$(ls "$WORK_DIR"/*.py 2>/dev/null | head -1)}
+EPOCHS=${EPOCHS:-1 2 3 4 5 6}
+GPUS=${GPUS:-8}
 PRED_INFOS=${PRED_INFOS:-nuscenes_prediction_infos_val.json}
 # Extra --cfg-options for inference-only switches, space separated, e.g.
-#   EXTRA="model.score_fusion=geometric" TAG=_geom sbatch --array=6 ...
-# TAG keeps the results in their own directory so runs can be compared.
+#   EXTRA="model.score_fusion=geometric" TAG=_geom
+# TAG keeps the results in their own directory so variants sit side by side.
 EXTRA=${EXTRA:-}
 TAG=${TAG:-}
 
-EPOCH=${SLURM_ARRAY_TASK_ID:?run me as an array job, e.g. sbatch --array=20 ...}
-CKPT=$WORK_DIR/epoch_${EPOCH}.pth
-OUT_DIR=$WORK_DIR/eval/epoch_${EPOCH}${TAG}
-
-if [ ! -f "$CKPT" ]; then
-    echo "no checkpoint at $CKPT -- nothing to do"
-    exit 0
+if [ -z "$CONFIG" ] || [ ! -f "$CONFIG" ]; then
+    echo "no config found in $WORK_DIR -- pass CONFIG=..." >&2
+    exit 1
 fi
 
 source env/requirements/activate.sh
-mkdir -p "$OUT_DIR"
 
 echo "host     : $(hostname)"
+echo "work dir : $WORK_DIR"
 echo "config   : $CONFIG"
-echo "epoch    : $EPOCH"
-echo "ckpt     : $CKPT"
-echo "out      : $OUT_DIR"
+echo "epochs   : $EPOCHS"
+[ -n "$EXTRA" ] && echo "cfg-opts : $EXTRA"
+nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 echo
+date
 
 # --output_dir is the jsonfile_prefix, so results_nusc.json lands in OUT_DIR.
 # --out is left off on purpose: it only adds a large results_nusc.pkl that
 # nothing downstream reads.
-echo "===== [epoch $EPOCH] detection / tracking ====="
-python tools/test.py "$CONFIG" "$CKPT" --eval bbox --output_dir "$OUT_DIR" \
-    ${EXTRA:+--cfg-options $EXTRA}
+pids=()
+labels=()
+gpu=0
+for EP in $EPOCHS; do
+    CKPT=$WORK_DIR/epoch_${EP}.pth
+    if [ ! -f "$CKPT" ]; then
+        echo "  epoch $EP: no checkpoint, skipping"
+        continue
+    fi
+    OUT_DIR=$WORK_DIR/eval/epoch_${EP}${TAG}
+    mkdir -p "$OUT_DIR"
+    echo "  epoch $EP -> GPU $gpu -> $OUT_DIR/eval.log"
+    (
+        set -euo pipefail
+        export CUDA_VISIBLE_DEVICES=$gpu
+        python tools/test.py "$CONFIG" "$CKPT" --eval bbox --output_dir "$OUT_DIR" \
+            ${EXTRA:+--cfg-options $EXTRA}
+        python tools/prediction_eval.py \
+            --result_path "$OUT_DIR/results_nusc.json" \
+            --prediction_infos_path "$PRED_INFOS"
+    ) > "$OUT_DIR/eval.log" 2>&1 &
+    pids+=($!)
+    labels+=("$EP")
+    gpu=$(( (gpu + 1) % GPUS ))
+done
+
+if [ ${#pids[@]} -eq 0 ]; then
+    echo "no checkpoints matched -- nothing to do"
+    exit 0
+fi
 
 echo
-echo "===== [epoch $EPOCH] trajectory prediction ====="
-python tools/prediction_eval.py \
-    --result_path "$OUT_DIR/results_nusc.json" \
-    --prediction_infos_path "$PRED_INFOS"
+fail=0
+for i in "${!pids[@]}"; do
+    if wait "${pids[$i]}"; then
+        echo "  epoch ${labels[$i]}: ok"
+    else
+        echo "  epoch ${labels[$i]}: FAILED (see $WORK_DIR/eval/epoch_${labels[$i]}${TAG}/eval.log)"
+        fail=1
+    fi
+done
+date
 
 echo
-echo "===== [epoch $EPOCH] done -> $OUT_DIR ====="
+echo "===== prediction metrics ====="
+for EP in $EPOCHS; do
+    f=$WORK_DIR/eval/epoch_${EP}${TAG}/prediction_metrics.json
+    [ -f "$f" ] && printf '  epoch %-3s %s\n' "$EP" "$(tr -d '\n ' < "$f")"
+done
+
+exit $fail

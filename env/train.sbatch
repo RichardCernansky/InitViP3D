@@ -25,12 +25,15 @@ set -euo pipefail
 REPO=${SLURM_SUBMIT_DIR:-$(pwd)}
 cd "$REPO"
 
-CONFIG=${CONFIG:-plugin/vip3d/configs/perun/non-augmented/livip3d_resnet50_lidar_img_guided.py}
+CONFIG=${CONFIG:-plugin/vip3d/configs/perun/non-augmented/livip3d_resnet50_joint.py}
 WORK_DIR=${WORK_DIR:-work_dirs/perun/non-augmented/joint_img_guided_necktrain_b16}
 GPUS=${GPUS:-8}
 BATCH=${BATCH:-2}              # clips per GPU; effective batch = GPUS * BATCH
 KEEP_CKPTS=${KEEP_CKPTS:--1}   # -1 = keep every epoch (20 x 231 MB on a 500 GB home)
 RESUME=${RESUME:-}             # checkpoint to continue from; empty = start fresh
+# Extra --cfg-options, space separated, for sweeps that vary one knob:
+#   BATCH=1 EXTRA="optimizer.lr=3.5e-4 lr_config.warmup_iters=700" sbatch ...
+EXTRA=${EXTRA:-}
 
 source env/requirements/activate.sh
 
@@ -40,6 +43,8 @@ export PORT=${PORT:-$((29400 + RANDOM % 500))}
 # Everything else -- lr, warmup, epochs, schedule -- comes from the config.
 OPTS=(data.samples_per_gpu="$BATCH"
       checkpoint_config.max_keep_ckpts="$KEEP_CKPTS")
+# shellcheck disable=SC2206  -- word splitting is how EXTRA becomes several options
+[ -n "$EXTRA" ] && OPTS+=($EXTRA)
 
 ARGS=(--work-dir "$WORK_DIR" --cfg-options "${OPTS[@]}")
 if [ -n "$RESUME" ]; then

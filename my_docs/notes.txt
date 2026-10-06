@@ -1,9 +1,14 @@
-batch_size
+batch_size - so the noise missing in large batch size does not do the exploration for the flat minima
 backbone training benefit?
 img_neck must train
 !img_guided init does not work
 jedna vrstva sa z vip3d inicializuje nahodne - treba 'img_neck.fpn_convs.3': dict(lr_mult=1.0),
 ask about gemetric vs. none
+
+detection results
+inference latency - 
+different query numbers
+lidar backbone - voxel net, voxel next
 
 does it come to a different valley with larger batch_size?
 
