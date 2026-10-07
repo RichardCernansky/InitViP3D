@@ -7,8 +7,8 @@ ask about gemetric vs. none
 
 detection results
 inference latency - 
-different query numbers
-lidar backbone - voxel net, voxel next
+run different query numbers
+run different lidar backbone - voxel net, voxel next
 
 does it come to a different valley with larger batch_size?
 

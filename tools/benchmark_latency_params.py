@@ -23,34 +23,19 @@ from mmdet3d.models import build_model
 
 MODELS = [
     dict(
-        name='ViP3D (baseline)',
-        config='work_dirs/non-augmented/vip3d_6cam/vip3d_resnet50_6cam.py',
-        checkpoint='work_dirs/non-augmented/vip3d_6cam/epoch_16.pth',
+        name='ViP3D (baseline, camera-only)',
+        config='work_dirs/beast/non-augmented/vip3d_6cam/vip3d_resnet50_6cam.py',
+        checkpoint='work_dirs/beast/non-augmented/vip3d_6cam/epoch_16.pth',
     ),
     dict(
-        name='S1 (LiDAR only)',
-        config='work_dirs/non-augmented/s1-livip3d_lidar_only/livip3d_resnet50_lidar_only.py',
-        checkpoint='work_dirs/non-augmented/s1-livip3d_lidar_only/epoch_12_epa14.pth',
+        name='LiViP3D LiDAR-only (s1, b16)',
+        config='work_dirs/perun/non-augmented/s1_lidar_only_b16/livip3d_resnet50_lidar_only.py',
+        checkpoint='work_dirs/perun/non-augmented/s1_lidar_only_b16/epoch_13.pth',
     ),
     dict(
-        name='S2 (+img-guided)',
-        config='work_dirs/non-augmented/s2-livip3d_lidar_img_guided/livip3d_resnet50_lidar_img_guided.py',
-        checkpoint='work_dirs/non-augmented/s2-livip3d_lidar_img_guided/epoch_10.pth',
-    ),
-    dict(
-        name='S3 (+SMCA, 3ep)',
-        config='work_dirs/non-augmented/s3-livip3d_lidar_img_guided_smca_3ep/livip3d_resnet50_lidar_img_guided_smca.py',
-        checkpoint='work_dirs/non-augmented/s3-livip3d_lidar_img_guided_smca_3ep/epoch_3.pth',
-    ),
-    dict(
-        name='S3 (+SMCA, 6ep)',
-        config='work_dirs/non-augmented/s3-livip3d_lidar_img_guided_smca_6ep/livip3d_resnet50_lidar_img_guided_smca.py',
-        checkpoint='work_dirs/non-augmented/s3-livip3d_lidar_img_guided_smca_6ep/epoch_5.pth',
-    ),
-    dict(
-        name='S1 augmented',
-        config='work_dirs/augmented/s1-lidar_only/livip3d_resnet50_lidar_only.py',
-        checkpoint='work_dirs/augmented/s1-lidar_only/epoch_20.pth',
+        name='LiViP3D +SMCA (s2, b16)',
+        config='work_dirs/perun/non-augmented/s2_smca_noguide_b16/livip3d_resnet50_smca_noguide.py',
+        checkpoint='work_dirs/perun/non-augmented/s2_smca_noguide_b16/epoch_4.pth',
     ),
 ]
 
@@ -156,10 +141,33 @@ def main():
     ap.add_argument(
         '--out', default='work_dirs/latency_params_results.json',
         help='where to dump raw results as JSON')
+    ap.add_argument(
+        '--checkpoint', default=None,
+        help='benchmark this checkpoint instead of the MODELS list; the config '
+             'defaults to the one mmdet dumped next to it in the work dir')
+    ap.add_argument('--config', default=None, help='config for --checkpoint')
+    ap.add_argument('--name', default=None, help='label for --checkpoint')
     args = ap.parse_args()
 
+    if args.checkpoint:
+        cfg = args.config
+        if cfg is None:
+            import glob as _glob
+            cand = sorted(_glob.glob(os.path.join(
+                os.path.dirname(args.checkpoint), '*.py')))
+            if not cand:
+                raise SystemExit('no config beside the checkpoint -- pass --config')
+            cfg = cand[0]
+        run_list = [dict(
+            name=args.name or os.path.join(
+                os.path.basename(os.path.dirname(args.checkpoint)),
+                os.path.basename(args.checkpoint)),
+            config=cfg, checkpoint=args.checkpoint)]
+    else:
+        run_list = MODELS
+
     results = []
-    for entry in MODELS:
+    for entry in run_list:
         if args.only and entry['name'] not in args.only:
             continue
         print(f'\n=== Benchmarking {entry["name"]} ===')
@@ -174,7 +182,9 @@ def main():
               f'latency={r["latency_ms"]:.1f}ms  fps={r["fps"]:.2f}  '
               f'(over {r["timed_iters"]} timed frames)')
 
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    outdir = os.path.dirname(args.out)
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
     with open(args.out, 'w') as f:
         json.dump(results, f, indent=2)
     print(f'\nRaw results written to {args.out}')
