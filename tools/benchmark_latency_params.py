@@ -14,7 +14,7 @@ import os
 import time
 
 import torch
-from mmcv import Config
+from mmcv import Config, DictAction
 from mmcv.parallel import MMDataParallel
 from mmcv.runner import load_checkpoint
 
@@ -59,9 +59,14 @@ def count_params(model):
     return sum(p.numel() for p in model.parameters())
 
 
-def benchmark_one(entry, num_warmup, num_timed, cudnn_benchmark=None):
+def benchmark_one(entry, num_warmup, num_timed, cudnn_benchmark=None,
+                  cfg_options=None):
     cfg = Config.fromfile(entry['config'])
     import_plugin(cfg, entry['config'])
+    # e.g. model.do_pred=False to time the detector/tracker without the
+    # trajectory predictor, which runs largely on the host
+    if cfg_options:
+        cfg.merge_from_dict(cfg_options)
 
     # Input shapes are fixed here, so autotuning pays for itself after the
     # warmup. The CLI flag overrides the config so every model in a run gets
@@ -159,6 +164,9 @@ def main():
     ap.add_argument(
         '--no-cudnn-benchmark', dest='cudnn_benchmark', action='store_false',
         help='force it off for every model')
+    ap.add_argument(
+        '--cfg-options', nargs='+', action=DictAction, default=None,
+        help='override config entries, e.g. model.do_pred=False')
     args = ap.parse_args()
 
     if args.checkpoint:
@@ -186,7 +194,8 @@ def main():
         print(f'  config:     {entry["config"]}')
         print(f'  checkpoint: {entry["checkpoint"]}')
         r = benchmark_one(entry, args.num_warmup, args.num_timed,
-                          cudnn_benchmark=args.cudnn_benchmark)
+                          cudnn_benchmark=args.cudnn_benchmark,
+                          cfg_options=args.cfg_options)
         r['cudnn_benchmark'] = torch.backends.cudnn.benchmark
         r['name'] = entry['name']
         r['config'] = entry['config']
