@@ -81,18 +81,28 @@ def main():
     # _inference_single is the parent of everything indented under it; the rest
     # of forward_test (padding, active selection, results, predictor) is the
     # difference between the total and it.
-    m._inference_single = timed('_inference_single (whole frame pass)', m._inference_single)
-    m.extract_feat = timed('  extract_feat (backbones)', m.extract_feat)
-    m.pts_bbox_head.forward = timed('  pts_bbox_head (decoder)', m.pts_bbox_head.forward)
-    m.track_base.update = timed('  track_base.update (300-query loop)', m.track_base.update)
-    m.velo_update = timed('  velo_update', m.velo_update)
-    m._generate_empty_tracks = timed('_generate_empty_tracks', m._generate_empty_tracks)
-    m._active_instances2results = timed('_active_instances2results', m._active_instances2results)
-    # These two are nn.Module children, so __setattr__ refuses a plain function.
-    # Wrapping .forward works because Module.__call__ looks up self.forward.
-    m.query_interact.forward = timed('query_interact (QIM)', m.query_interact.forward)
+    # Indentation encodes nesting: a row sits inside the nearest less-indented
+    # row above it, so only depth-0 rows are disjoint.
+    m.forward_test = timed('forward_test (everything but the scatter)', m.forward_test)
+    m._inference_single = timed('  _inference_single (frame pass)', m._inference_single)
+    m.extract_feat = timed('    extract_feat (backbones)', m.extract_feat)
+    m.pts_bbox_head.forward = timed('    pts_bbox_head (decoder)', m.pts_bbox_head.forward)
+    m.track_base.update = timed('    track_base.update (300-query loop)', m.track_base.update)
+    m.velo_update = timed('    velo_update', m.velo_update)
+    # nn.Module children: __setattr__ refuses a plain function, but wrapping
+    # .forward works because Module.__call__ looks up self.forward.
+    m.query_interact.forward = timed('    query_interact (QIM)', m.query_interact.forward)
     if getattr(m, 'memory_bank', None) is not None:
-        m.memory_bank.forward = timed('memory_bank', m.memory_bank.forward)
+        m.memory_bank.forward = timed('    memory_bank', m.memory_bank.forward)
+    m._generate_empty_tracks = timed('  _generate_empty_tracks', m._generate_empty_tracks)
+    m._active_instances2results = timed('  _active_instances2results', m._active_instances2results)
+    m.query_interact._select_active_tracks = timed(
+        '  _select_active_tracks', m.query_interact._select_active_tracks)
+    # Instances.cat / __getitem__ copy every field (~15 tensors, some 300x512)
+    # and are called several times per frame; patch the class, not an instance.
+    from plugin.vip3d.structures import Instances
+    Instances.cat = staticmethod(timed('  Instances.cat', Instances.cat))
+    Instances.__getitem__ = timed('  Instances.__getitem__', Instances.__getitem__)
     if getattr(m, 'use_lidar', False):
         m._compute_heatmap = timed('  _compute_heatmap', m._compute_heatmap)
         m._fill_empty_slots = timed('  _fill_empty_slots (topk)', m._fill_empty_slots)
@@ -119,7 +129,7 @@ def main():
     print(f'{"stage":<42}{"ms/frame":>10}{"% total":>9}{"calls/frame":>13}')
     # Only unindented rows are disjoint; indented ones sit inside a parent and
     # would be double-counted if summed with it.
-    acc = sum(v for k, v in TIMES.items() if not k.startswith('  ')) / n * 1000
+    acc = sum(v for k, v in TIMES.items() if not k.startswith(' ')) / n * 1000
     for k in sorted(TIMES, key=lambda x: -TIMES[x]):
         ms = TIMES[k] / n * 1000
         print(f'{k:<42}{ms:>10.1f}{100 * ms / tot_ms:>8.1f}%'

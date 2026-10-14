@@ -22,21 +22,21 @@ from mmdet3d.datasets import build_dataloader, build_dataset
 from mmdet3d.models import build_model
 
 MODELS = [
-    dict(
-        name='ViP3D (baseline, camera-only)',
-        config='work_dirs/beast/non-augmented/vip3d_6cam/vip3d_resnet50_6cam.py',
-        checkpoint='work_dirs/beast/non-augmented/vip3d_6cam/epoch_16.pth',
-    ),
-    dict(
-        name='LiViP3D LiDAR-only (s1, b16)',
-        config='work_dirs/perun/non-augmented/s1_lidar_only_b16/livip3d_resnet50_lidar_only.py',
-        checkpoint='work_dirs/perun/non-augmented/s1_lidar_only_b16/epoch_13.pth',
-    ),
-    dict(
-        name='LiViP3D +SMCA (s2, b16)',
-        config='work_dirs/perun/non-augmented/s2_smca_noguide_b16/livip3d_resnet50_smca_noguide.py',
-        checkpoint='work_dirs/perun/non-augmented/s2_smca_noguide_b16/epoch_4.pth',
-    ),
+    # dict(
+    #     name='ViP3D (baseline, camera-only)',
+    #     config='work_dirs/beast/non-augmented/vip3d_6cam/vip3d_resnet50_6cam.py',
+    #     checkpoint='work_dirs/beast/non-augmented/vip3d_6cam/epoch_16.pth',
+    # ),
+    # dict(
+    #     name='LiViP3D LiDAR-only (s1, b16)',
+    #     config='work_dirs/perun/non-augmented/s1_lidar_only_b16/livip3d_resnet50_lidar_only.py',
+    #     checkpoint='work_dirs/perun/non-augmented/s1_lidar_only_b16/epoch_13.pth',
+    # ),
+    # dict(
+    #     name='LiViP3D +SMCA (s2, b16)',
+    #     config='work_dirs/perun/non-augmented/s2_smca_noguide_b16/livip3d_resnet50_smca_noguide.py',
+    #     checkpoint='work_dirs/perun/non-augmented/s2_smca_noguide_b16/epoch_4.pth',
+    # ),
 ]
 
 
@@ -102,6 +102,10 @@ def benchmark_one(entry, num_warmup, num_timed, cudnn_benchmark=None,
     total = num_warmup + num_timed
     pure_inf_time = 0.0
     timed_iters = 0
+    # Per-frame times, not just the mean: on real nuScenes frames the predictor's
+    # cost scales with the agent and polyline count, so the spread says whether a
+    # reported mean came from varied frames or from one input replayed.
+    per_frame = []
     for i, data in enumerate(data_loader):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -112,6 +116,7 @@ def benchmark_one(entry, num_warmup, num_timed, cudnn_benchmark=None,
 
         if i >= num_warmup:
             pure_inf_time += elapsed
+            per_frame.append(elapsed * 1000)
             timed_iters += 1
             if timed_iters % 50 == 0:
                 print(f'  [{timed_iters}/{num_timed}] '
@@ -132,11 +137,19 @@ def benchmark_one(entry, num_warmup, num_timed, cudnn_benchmark=None,
     gc.collect()
     torch.cuda.empty_cache()
 
+    srt = sorted(per_frame)
+    mean = latency_ms
+    std = (sum((x - mean) ** 2 for x in per_frame) / len(per_frame)) ** 0.5
     return dict(
         params_m=n_params / 1e6,
         latency_ms=latency_ms,
         fps=fps,
         timed_iters=timed_iters,
+        std_ms=std,
+        min_ms=srt[0],
+        p50_ms=srt[len(srt) // 2],
+        p95_ms=srt[int(len(srt) * 0.95)],
+        max_ms=srt[-1],
     )
 
 
@@ -204,6 +217,9 @@ def main():
         print(f'  -> params={r["params_m"]:.2f}M  '
               f'latency={r["latency_ms"]:.1f}ms  fps={r["fps"]:.2f}  '
               f'(over {r["timed_iters"]} timed frames)')
+        print(f'     mean {r["latency_ms"]:.2f} +- {r["std_ms"]:.2f}   '
+              f'min {r["min_ms"]:.2f}  p50 {r["p50_ms"]:.2f}  '
+              f'p95 {r["p95_ms"]:.2f}  max {r["max_ms"]:.2f} ms')
 
     outdir = os.path.dirname(args.out)
     if outdir:
