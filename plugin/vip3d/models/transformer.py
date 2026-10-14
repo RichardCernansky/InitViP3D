@@ -369,12 +369,14 @@ class TransFusionTransformerDecoder(BaseModule):
 
     def __init__(self, embed_dims=256, num_heads=8, ffn_dims=512, dropout=0.1,
                  lidar_bev_attn=None, smca_attn=None, use_smca=False,
-                 pc_range=None, **kwargs):
+                 pc_range=None, debug=False, **kwargs):
         super(TransFusionTransformerDecoder, self).__init__()
         from mmcv.cnn.bricks.registry import ATTENTION as ATT_REG
         self.embed_dims = embed_dims
         self.num_layers = 2
         self.use_smca = use_smca
+        # see LiDARBEVDeformCrossAtten.debug
+        self.debug = debug
 
         # ── Layer 0: self-attn + LiDAR BEV cross-attn + FFN
         self.sa0 = nn.MultiheadAttention(embed_dims, num_heads, dropout=dropout)
@@ -482,8 +484,10 @@ class TransFusionTransformerDecoder(BaseModule):
         mask = no_cam_mask.permute(1, 0).unsqueeze(-1)  # [num_q, B, 1]
         # take q_layer0 for queries with no valid camera view (mask=1), otherwise take q after SMCA cross-attn and FFN
         q = torch.where(mask, q_layer0, q)
-        from . import bev_vis as _bv
-        if _bv.DEBUG_PRINTS:
+
+        #---DDEBUG---
+        if self.debug:
+            # .item() and .mean() force a host sync, so this stays behind the flag
             layer1_delta = (q - q_layer0).norm(dim=-1).mean().item()
             print(f"[Decoder] no_cam_mask={mask.float().mean():.3f}  layer1_delta_norm={layer1_delta:.4f}  (>0.1=SMCA contributing)")
 

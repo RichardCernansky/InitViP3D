@@ -199,7 +199,6 @@ model = dict(
             offset=-0.5),
     ),
     debug=True,
-    bev_vis=True,
     vis_interval=20,
     use_img_guided=True,   # full model: guided query init + SMCA fusion
     use_smca=True,

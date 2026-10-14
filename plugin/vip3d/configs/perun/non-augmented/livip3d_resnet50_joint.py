@@ -193,7 +193,6 @@ model = dict(
             offset=-0.5),
     ),
     debug=False,
-    bev_vis=True,
     vis_interval=20,
     use_img_guided=True,
     use_smca=False,

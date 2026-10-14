@@ -6,9 +6,10 @@ Launch viewer:  tensorboard --logdir runs/bev_vis
 
 import torch.distributed as dist
 
-# ENABLED       = True
-# DEBUG_PRINTS  = False
-# VIS_INTERVAL  = 20
+# How often the visualisers fire, counted in visualize_bev() calls.
+# Whether they fire at all is the caller's decision (model.debug) --
+# this module no longer keeps an enable flag of its own.
+VIS_INTERVAL = 20
 _CLASS_NAMES = ['car', 'truck', 'bus', 'trailer', 'motorcycle', 'bicycle', 'pedestrian']
 
 _writer        = None
@@ -82,8 +83,6 @@ def visualize_train_smca(heatmap, img):
     heatmap : Tensor [B, K_cls, H, W]  pre-sigmoid logits
     img     : Tensor [B, num_cam, 3, H_img, W_img]  normalised BGR (mean-only)
     """
-    if not ENABLED:
-        return
     if dist.is_initialized() and dist.get_rank() != 0:
         return
     if _step % VIS_INTERVAL != 0:
@@ -164,8 +163,6 @@ def visualize_smca_gauss(img):
 
     img : Tensor [B, num_cam, 3, H_img, W_img]
     """
-    if not ENABLED:
-        return
     if dist.is_initialized() and dist.get_rank() != 0:
         return
     if _step % VIS_INTERVAL != 0:
@@ -244,8 +241,6 @@ def visualize_bev(bev_feat, heatmap, gt_hm=None):
     global _step
     _step += 1
 
-    if not ENABLED:
-        return
     if dist.is_initialized() and dist.get_rank() != 0:
         return
     if _step % VIS_INTERVAL != 0:
@@ -293,8 +288,6 @@ def visualize_lidar_bev_attn(bev_feat, reference_points, sample_xy=None, attn_w=
         sample_xy        : Tensor [B, N, P, 2]     deformable sampling locations [0,1]
         attn_w           : Tensor [B, N, P]        softmax attention weights per sampling pt
     """
-    if not ENABLED:
-        return
     if dist.is_initialized() and dist.get_rank() != 0:
         return
     if _step % VIS_INTERVAL != 0:

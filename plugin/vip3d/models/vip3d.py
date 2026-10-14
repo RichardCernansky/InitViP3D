@@ -107,9 +107,11 @@ class ViP3D(MVXTwoStageDetector):
                 # position into its score. None (default) keeps the decoder's
                 # class score alone; 'geometric' is TransFusion's rule.
                 score_fusion=None,
+                # Single switch for all diagnostics: debug prints in the decoder
+                # and attention modules, and the BEV/SMCA visualisers. Off means
+                # none of them run, so no stray host syncs in the forward pass.
                 debug=False,
-                bev_vis=True,
-                vis_interval=20,
+                vis_interval=20,   # how often the visualisers fire, when debug
                 use_img_guided=False,
                 use_smca=False,
                 # END NEW
@@ -164,13 +166,13 @@ class ViP3D(MVXTwoStageDetector):
                              img_backbone, pts_backbone, img_neck, pts_neck,
                              pts_bbox_head, img_roi_head, img_rpn_head,
                              train_cfg, test_cfg, pretrained)
+        # model.debug is the only diagnostics switch: it gates the debug prints
+        # in the decoder and attention modules and every visualiser call. The
+        # call sites decide whether to call, so bev_vis keeps no enable flag --
+        # only how often to fire once asked.
         import plugin.vip3d.models.bev_vis as _bv_mod
-        _bv_mod.ENABLED      = bev_vis
-        _bv_mod.DEBUG_PRINTS = debug
         _bv_mod.VIS_INTERVAL = vis_interval
-        # Also kept on self so the call sites can skip the visualiser outright
-        # instead of relying on the module-global guard inside each function.
-        self.bev_vis = bev_vis
+        self.debug = debug
 
         self.grid_mask = GridMask(True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7)
         self.use_grid_mask = use_grid_mask
@@ -188,6 +190,16 @@ class ViP3D(MVXTwoStageDetector):
 
         self.use_smca = use_smca
         self.pts_bbox_head.transformer.decoder.use_smca = use_smca
+
+        #---DEBUG---
+        # Push model.debug down to the decoder and its two cross-attentions,
+        # which print their own diagnostics. Each defaults to False in its
+        # __init__, so they are safe when built outside ViP3D and this only
+        # ever turns them on -- one config key, no module-level globals.
+        _dec = self.pts_bbox_head.transformer.decoder
+        for _m in (_dec, getattr(_dec, 'ca0', None), getattr(_dec, 'ca1', None)):
+            if _m is not None and hasattr(_m, 'debug'):
+                _m.debug = debug
 
         self.use_lidar = use_lidar
         self.heatmap_score_thresh = heatmap_score_thresh
@@ -605,6 +617,7 @@ class ViP3D(MVXTwoStageDetector):
             filled = self._fill_empty_slots(
                 track_instances, heatmap, feat_for_queries, img_metas)
 
+            #---DEBUG---
             if vis and filled is not None:
                 # debug vis - store top-20 for SMCA visualisation
                 from .bev_vis import set_top_queries as _set_tq
@@ -905,7 +918,7 @@ class ViP3D(MVXTwoStageDetector):
                   for key, value in kwargs.items()}
 
         if True:
-            vis = self.bev_vis and b == 0   # the visualiser follows the first clip only
+            vis = self.debug and b == 0   # the visualiser follows the first clip only
             for i in range(num_frame):
 
                 if i == num_frame - 1:
@@ -1106,19 +1119,24 @@ class ViP3D(MVXTwoStageDetector):
 
             # ── end LiViP3D ──────────────────────────────────────────────────────────
 
+            #---DDEBUG
             # ── Pass heatmap + GT to BEV visualiser ──────────────────────────
-            from .bev_vis import set_gt_bev as _set_gt, set_heatmap as _set_hm
-            _set_hm(heatmap if self.use_lidar and pts_feats is not None else None)
-            if gt_bboxes_3d is not None:
-                import numpy as np
-                boxes = gt_bboxes_3d[0].tensor if hasattr(gt_bboxes_3d[0], 'tensor') \
-                        else gt_bboxes_3d[0]        # [N, >=3] metric: x,y,z,...
-                pc = self.pc_range
-                x_n = ((boxes[:, 0].cpu().numpy() - pc[0]) / (pc[3] - pc[0])).clip(0, 1)
-                y_n = ((boxes[:, 1].cpu().numpy() - pc[1]) / (pc[4] - pc[1])).clip(0, 1)
-                _set_gt(np.stack([x_n, y_n], axis=1))
-            else:
-                _set_gt(None)
+            # Gated on bev_vis, which until now was only honoured in the train
+            # path. set_heatmap pulls the whole heatmap to the host and the GT
+            # branch adds two more copies; each blocks until the queued GPU work
+            if self.debug:
+                from .bev_vis import set_gt_bev as _set_gt, set_heatmap as _set_hm
+                _set_hm(heatmap if self.use_lidar and pts_feats is not None else None)
+                if gt_bboxes_3d is not None:
+                    import numpy as np
+                    boxes = gt_bboxes_3d[0].tensor if hasattr(gt_bboxes_3d[0], 'tensor') \
+                            else gt_bboxes_3d[0]        # [N, >=3] metric: x,y,z,...
+                    pc = self.pc_range
+                    x_n = ((boxes[:, 0].cpu().numpy() - pc[0]) / (pc[3] - pc[0])).clip(0, 1)
+                    y_n = ((boxes[:, 1].cpu().numpy() - pc[1]) / (pc[4] - pc[1])).clip(0, 1)
+                    _set_gt(np.stack([x_n, y_n], axis=1))
+                else:
+                    _set_gt(None)
             # ─────────────────────────────────────────────────────────────────
 
             output_classes, output_coords, \
@@ -1569,7 +1587,15 @@ class ViP3D(MVXTwoStageDetector):
                     max(0, r - sup_r):min(H, r + sup_r + 1),
                     max(0, c - sup_r):min(W, c + sup_r + 1)] = 0.0
 
-        if img_metas is not None and 'lidar2img' in img_metas[0]:  # skipped for lidar-only
+        # Restrict query birth to camera-visible BEV cells only on a partial
+        # rig, matching the condition _forward_train_single uses for GT
+        # visibility. With 6 cameras the coverage is 360 degrees, so the mask is
+        # all ones apart from near-field and image-edge cells -- trimming those
+        # would deny queries to objects the LiDAR sees perfectly well, and only
+        # on the camera configs, making them not comparable to lidar-only.
+        check_cam_vis = (img_metas is not None and 'lidar2img' in img_metas[0]
+                         and self.pts_bbox_head.num_cams < 6)
+        if check_cam_vis:
             vis_mask = self._build_camera_visibility_mask(H, W, img_metas, heatmap.device)
             scores = scores * vis_mask.unsqueeze(0).unsqueeze(0).float()
 

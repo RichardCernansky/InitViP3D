@@ -59,21 +59,25 @@ def count_params(model):
     return sum(p.numel() for p in model.parameters())
 
 
-def benchmark_one(entry, num_warmup, num_timed):
+def benchmark_one(entry, num_warmup, num_timed, cudnn_benchmark=None):
     cfg = Config.fromfile(entry['config'])
     import_plugin(cfg, entry['config'])
 
-    if cfg.get('cudnn_benchmark', False):
-        torch.backends.cudnn.benchmark = True
+    # Input shapes are fixed here, so autotuning pays for itself after the
+    # warmup. The CLI flag overrides the config so every model in a run gets
+    # the same setting -- comparing models under different cuDNN behaviour
+    # would measure the setting, not the architecture.
+    if cudnn_benchmark is None:
+        cudnn_benchmark = cfg.get('cudnn_benchmark', False)
+    torch.backends.cudnn.benchmark = bool(cudnn_benchmark)
 
     cfg.model.pretrained = None
     cfg.model.train_cfg = None
     cfg.data.test.test_mode = True
-    # Disable in-forward debug prints / TensorBoard BEV visualization (bev_vis.py):
-    # these run extra tensor ops + matplotlib/TensorBoard rendering every
-    # vis_interval steps and are not part of real inference cost.
+    # Disable in-forward debug prints and the BEV/SMCA visualisers: they add
+    # tensor ops, host syncs and matplotlib/TensorBoard rendering that are not
+    # part of real inference cost. model.debug is the single switch for both.
     cfg.model.debug = False
-    cfg.model.bev_vis = False
 
     dataset = build_dataset(cfg.data.test)
     data_loader = build_dataloader(
@@ -147,6 +151,14 @@ def main():
              'defaults to the one mmdet dumped next to it in the work dir')
     ap.add_argument('--config', default=None, help='config for --checkpoint')
     ap.add_argument('--name', default=None, help='label for --checkpoint')
+    ap.add_argument(
+        '--cudnn-benchmark', dest='cudnn_benchmark', action='store_true',
+        default=None,
+        help='force torch.backends.cudnn.benchmark on for every model '
+             '(default: whatever each config says, which is off)')
+    ap.add_argument(
+        '--no-cudnn-benchmark', dest='cudnn_benchmark', action='store_false',
+        help='force it off for every model')
     args = ap.parse_args()
 
     if args.checkpoint:
@@ -173,7 +185,9 @@ def main():
         print(f'\n=== Benchmarking {entry["name"]} ===')
         print(f'  config:     {entry["config"]}')
         print(f'  checkpoint: {entry["checkpoint"]}')
-        r = benchmark_one(entry, args.num_warmup, args.num_timed)
+        r = benchmark_one(entry, args.num_warmup, args.num_timed,
+                          cudnn_benchmark=args.cudnn_benchmark)
+        r['cudnn_benchmark'] = torch.backends.cudnn.benchmark
         r['name'] = entry['name']
         r['config'] = entry['config']
         r['checkpoint'] = entry['checkpoint']

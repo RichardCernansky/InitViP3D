@@ -112,7 +112,7 @@ model = dict(
         depth=50,
         num_stages=4,
         out_indices=(0, 1, 2, 3),
-        frozen_stages=1,   # stem + layer1 frozen; layer2-4 adapt (as in ViP3D)
+        frozen_stages=4,   # whole backbone frozen (stop grad + eval)
         norm_cfg=dict(type='BN2d', requires_grad=False),
         norm_eval=True,
         style='caffe',
@@ -195,7 +195,6 @@ model = dict(
             offset=-0.5),
     ),
     debug=True,
-    bev_vis=True,
     vis_interval=20,
     use_img_guided=False,  # ablation: SMCA fusion only
     use_smca=True,
@@ -299,7 +298,7 @@ test_pipeline_post = [
 # Clips per GPU. The backbones run batched over them; tracking and prediction
 # run clip by clip and the losses are averaged (ViP3D.forward_train). The LR
 # is not rescaled with it.
-samples_per_gpu = 2   # 8 GPUs -> effective batch 16, 1758 iters/epoch
+samples_per_gpu = 1   # 8 GPUs -> effective batch 8, 3516 iters/epoch
 
 data = dict(
     samples_per_gpu=samples_per_gpu,
@@ -341,10 +340,10 @@ data = dict(
 
 optimizer = dict(
     type='AdamW',
-    lr=5e-4,   # sqrt-scaled from 1e-3 at batch 64
+    lr=3.5e-4,   # sqrt-scaled from 5e-4 at batch 16
     paramwise_cfg=dict(
         custom_keys={
-            'img_backbone': dict(lr_mult=0.1),          # -> 5e-5, DETR3D weights adapt
+            'img_backbone': dict(lr_mult=0.0),          # frozen via frozen_stages=4
             'img_neck':     dict(lr_mult=0.1),          # pretrained DETR3D FPN
             # fpn_convs.3 can't load from DETR3D (add_extra_convs='on_input'),
             # so it starts random and needs the full rate. Longest key wins.
@@ -359,7 +358,7 @@ optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
 lr_config = dict(
     policy='CosineAnnealing',
     warmup='linear',
-    warmup_iters=180,   # ~1.7% of the 10.5k steps in 6 epochs at batch 16
+    warmup_iters=350,   # ~1.7% of the 21k steps in 6 epochs at batch 8
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
 )
@@ -373,5 +372,5 @@ find_unused_parameters = True
 # Stage 1 (LiDAR-only, 20 epochs). Carries the frozen DETR3D image backbone
 # and neck too, so nothing else needs loading. img_bev_proj, img_hm_head and
 # the SMCA layer are new here and start from their init.
-load_from = 'work_dirs/perun/non-augmented/s1_lidar_only_b16/epoch_20.pth'
+load_from = 'work_dirs/perun/non-augmented/s1_lidar_only_b8/epoch_20.pth'
 # fp16 = dict(loss_scale='dynamic')

@@ -58,6 +58,34 @@ def to_detection_format(src, dst):
     return len(results), n
 
 
+def pr_at_endpoint(details, cls, dist):
+    """-> (recall, precision, confidence) where the PR curve runs out of boxes.
+
+    The devkit stores each curve on a fixed 101-point recall grid, so the entries
+    past the highest recall the model reached are zero-filled. The last entry
+    with a nonzero confidence is therefore the real end of the curve: precision
+    beyond it is 0 because nothing was submitted there, not because what was
+    submitted was wrong.
+
+    The confidence at that point is the diagnostic. A curve that ran out of
+    genuine candidates ends near 0; one that ends at the model's score threshold
+    was cut off, and every recall bin above it counts as zero precision in the
+    AP average -- so AP understates the detector by however much of the curve
+    was never submitted.
+    """
+    key = next((k for k in details
+                if k.rsplit(':', 1)[0] == cls
+                and abs(float(k.rsplit(':', 1)[1]) - dist) < 1e-6), None)
+    if key is None:
+        return None
+    v = details[key]
+    nz = [i for i, c in enumerate(v['confidence']) if c > 0]
+    if not nz:
+        return 0.0, 0.0, 0.0
+    i = nz[-1]
+    return v['recall'][i], v['precision'][i], v['confidence'][i]
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('eval_dirs', nargs='+',
@@ -69,6 +97,9 @@ def main():
                    help='skip rendering the PR / TP curves')
     p.add_argument('--classes', nargs='*', default=['car', 'pedestrian'],
                    help='classes to break out in the per-class table')
+    p.add_argument('--pr-dist', type=float, default=2.0,
+                   help='centre-distance threshold for the precision/recall table; '
+                        '2 m is what ViP3D prediction eval matches at')
     args = p.parse_args()
 
     dirs = [d for pat in args.eval_dirs for d in sorted(glob(pat))]
@@ -131,6 +162,41 @@ def main():
                   + ''.join(f'{x:>7.3f}' for x in errs))
     print('  NDS* = (5*AP + sum(1 - min(1, err))) / 10 on this class alone;'
           ' NDS is officially defined over all 10 classes.')
+
+    # Precision/recall at a single threshold, which is what "what does it get
+    # wrong, in percent" actually asks for. AP hides this: it averages over
+    # four thresholds and the whole recall range, so a class can have a low AP
+    # either because its boxes are imprecise or because it never found many.
+    # Matching here is centre distance in BEV, 1:1, no IoU -- the same criterion
+    # ViP3D's prediction eval uses at its first step, so these are comparable.
+    print(f'\n===== precision / recall @ {args.pr_dist} m centre distance =====')
+    for d, m in summary:
+        details_path = osp.join(d, 'det', 'metrics_details.json')
+        if not osp.isfile(details_path):
+            print(f'\n  {d}: no metrics_details.json')
+            continue
+        with open(details_path) as f:
+            details = json.load(f)
+        rows = []
+        for c in m['mean_dist_aps']:
+            pr = pr_at_endpoint(details, c, args.pr_dist)
+            if pr is not None:
+                rows.append((c, *pr, m['mean_dist_aps'][c]))
+        rows.sort(key=lambda r: -r[1])          # worst recall last: reads top-down
+        print(f'\n  {d}')
+        # recall/prec are at one threshold; AP is the devkit's per-class mean
+        # over all four, so the two columns are not two views of one number
+        print(f'    {"class":<22}{"recall":>8}{"prec":>8}{"conf@end":>10}'
+              f'{"AP(4ths)":>10}')
+        for c, r, prec, conf, ap in rows:
+            note = '   never predicted' if r == 0 else ''
+            print(f'    {c:<22}{100 * r:>7.1f}%{100 * prec:>7.1f}%'
+                  f'{conf:>10.3f}{ap:>10.3f}{note}')
+    print('\n  recall = found / all GT in range;  prec = correct / all submitted.')
+    # print('  conf@end is the score of the lowest-confidence box submitted. When it')
+    # print('  sits at the model\'s filter_score_thresh the curve was truncated, not')
+    # print('  exhausted: the detector had more boxes and the gate dropped them, so')
+    # print('  AP is lower than the detector itself.')
 
 
 if __name__ == '__main__':

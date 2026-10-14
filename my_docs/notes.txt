@@ -1,9 +1,69 @@
+(temp) riceke350@login01:~/LiViP3D$  bash -c 'source env/requirements/activate.sh && python tools/detection_eval.py \
+    work_dirs/perun/non-augmented/s1_lidar_only_b16/eval/epoch_13_max'
+
+=== work_dirs/perun/non-augmented/s1_lidar_only_b16/eval/epoch_13_max
+    60925 boxes over 6019 frames -> work_dirs/perun/non-augmented/s1_lidar_only_b16/eval/epoch_13_max/det/results_det.json
+mAP: 0.0948                                                                                                                                                                                                                                                                  
+mATE: 0.7139
+mASE: 0.6717
+mAOE: 0.6707
+mAVE: 0.7687
+mAAE: 0.5400
+NDS: 0.2109
+Eval time: 14.0s
+
+Per-class results:
+Object Class            AP      ATE     ASE     AOE     AVE     AAE   
+car                     0.450   0.207   0.318   0.274   0.290   0.223 
+truck                   0.090   0.415   0.368   0.248   0.213   0.248 
+bus                     0.008   0.952   0.406   0.357   1.946   0.296 
+trailer                 0.000   1.000   1.000   1.000   1.000   1.000 
+construction_vehicle    0.000   1.000   1.000   1.000   1.000   1.000 
+pedestrian              0.392   0.205   0.297   0.322   0.315   0.067 
+motorcycle              0.008   0.360   0.327   0.835   0.385   0.485 
+bicycle                 0.000   1.000   1.000   1.000   1.000   1.000 
+traffic_cone            0.000   1.000   1.000   nan     nan     nan   
+barrier                 0.000   1.000   1.000   1.000   nan     nan   
+    mAP=0.0948  NDS=0.2109  -> work_dirs/perun/non-augmented/s1_lidar_only_b16/eval/epoch_13_max/det
+
+===== detection metrics =====
+  run                                                mAP     NDS    mATE    mAOE
+  ugmented/s1_lidar_only_b16/eval/epoch_13_max    0.0948  0.2109   0.714   0.671
+
+===== per class (car, pedestrian) =====
+  run                                     class            AP   NDS*    ATE    ASE    AOE    AVE    AAE
+  ed/s1_lidar_only_b16/eval/epoch_13_max  car           0.450  0.594  0.207  0.318  0.274  0.290  0.223
+  ed/s1_lidar_only_b16/eval/epoch_13_max  pedestrian    0.392  0.575  0.205  0.297  0.322  0.315  0.067
+  NDS* = (5*AP + sum(1 - min(1, err))) / 10 on this class alone; NDS is officially defined over all 10 classes.
+
+===== precision / recall @ 2.0 m centre distance =====
+
+  work_dirs/perun/non-augmented/s1_lidar_only_b16/eval/epoch_13_max
+    class                   recall    prec  conf@end  AP(4ths)
+    car                      59.0%   78.6%     0.375     0.450
+    pedestrian               51.0%   83.3%     0.372     0.392
+    truck                    26.0%   59.4%     0.372     0.090
+    bus                      12.0%   46.6%     0.405     0.008
+    motorcycle               12.0%   59.7%     0.358     0.008
+    bicycle                   8.0%   47.7%     0.431     0.000
+    trailer                   2.0%   45.4%     0.400     0.000
+    construction_vehicle      0.0%    0.0%     0.000     0.000   never predicted
+    traffic_cone              0.0%    0.0%     0.000     0.000   never predicted
+    barrier                   0.0%    0.0%     0.000     0.000   never predicted
+
+  recall = found / all GT in range;  prec = correct / all submitted.
+
+cd ~/LiViP3D && WORK_DIR=work_dirs/perun/non-augmented/s2_smca_noguide_b8_best sbatch env/eval_epochs.sbatch
+cd ~/LiViP3D && WORK_DIR=work_dirs/perun/non-augmented/s2_smca_noguide_b8_q100 sbatch env/eval_epochs.sbatch
+
+
 batch_size - so the noise missing in large batch size does not do the exploration for the flat minima
 backbone training benefit?
 img_neck must train
 !img_guided init does not work
 jedna vrstva sa z vip3d inicializuje nahodne - treba 'img_neck.fpn_convs.3': dict(lr_mult=1.0),
 ask about gemetric vs. none
+
 
 detection results
 inference latency - 
