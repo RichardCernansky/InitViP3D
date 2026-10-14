@@ -60,7 +60,7 @@ def count_params(model):
 
 
 def benchmark_one(entry, num_warmup, num_timed, cudnn_benchmark=None,
-                  cfg_options=None):
+                  cfg_options=None, fixed_input=False):
     cfg = Config.fromfile(entry['config'])
     import_plugin(cfg, entry['config'])
     # e.g. model.do_pred=False to time the detector/tracker without the
@@ -98,6 +98,15 @@ def benchmark_one(entry, num_warmup, num_timed, cudnn_benchmark=None,
 
     model = MMDataParallel(model.cuda(), device_ids=[0])
     model.eval()
+
+    if fixed_input:
+        # Replay one batch instead of walking the val set. Per-frame cost here
+        # swings with how many agents and map polylines a frame holds, so a mean
+        # over real traffic and a mean over one repeated frame are different
+        # quantities -- a published figure with a near-zero std was measured
+        # this way, and only this mode is comparable to it.
+        one = next(iter(data_loader))
+        data_loader = (one for _ in range(num_warmup + num_timed))
 
     total = num_warmup + num_timed
     pure_inf_time = 0.0
@@ -180,6 +189,11 @@ def main():
     ap.add_argument(
         '--cfg-options', nargs='+', action=DictAction, default=None,
         help='override config entries, e.g. model.do_pred=False')
+    ap.add_argument(
+        '--fixed-input', action='store_true',
+        help='replay a single batch instead of walking the val set; matches a '
+             'protocol whose reported std is near zero, and is NOT comparable '
+             'to the default (which averages over real, varying frames)')
     args = ap.parse_args()
 
     if args.checkpoint:
@@ -208,8 +222,10 @@ def main():
         print(f'  checkpoint: {entry["checkpoint"]}')
         r = benchmark_one(entry, args.num_warmup, args.num_timed,
                           cudnn_benchmark=args.cudnn_benchmark,
-                          cfg_options=args.cfg_options)
+                          cfg_options=args.cfg_options,
+                          fixed_input=args.fixed_input)
         r['cudnn_benchmark'] = torch.backends.cudnn.benchmark
+        r['fixed_input'] = args.fixed_input
         r['name'] = entry['name']
         r['config'] = entry['config']
         r['checkpoint'] = entry['checkpoint']
