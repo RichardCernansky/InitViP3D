@@ -85,9 +85,11 @@ def main():
     m.pts_bbox_head.forward = timed('  pts_bbox_head (decoder)', m.pts_bbox_head.forward)
     m.track_base.update = timed('  track_base.update (300-query loop)', m.track_base.update)
     m._active_instances2results = timed('_active_instances2results', m._active_instances2results)
-    m.query_interact = timed('query_interact (QIM)', m.query_interact)
+    # These two are nn.Module children, so __setattr__ refuses a plain function.
+    # Wrapping .forward works because Module.__call__ looks up self.forward.
+    m.query_interact.forward = timed('query_interact (QIM)', m.query_interact.forward)
     if getattr(m, 'memory_bank', None) is not None:
-        m.memory_bank = timed('memory_bank', m.memory_bank)
+        m.memory_bank.forward = timed('memory_bank', m.memory_bank.forward)
     if getattr(m, 'use_lidar', False):
         m._compute_heatmap = timed('  _compute_heatmap', m._compute_heatmap)
         m._fill_empty_slots = timed('  _fill_empty_slots (topk)', m._fill_empty_slots)
