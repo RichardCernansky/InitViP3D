@@ -78,12 +78,15 @@ def main():
     model.eval()
 
     m = model.module
-    # Coarse stages, outermost first. Nested ones (the head inside the single
-    # frame pass) are reported separately, so they double-count into their
-    # parent -- the indentation in the output shows which.
-    m.extract_feat = timed('extract_feat (backbones)', m.extract_feat)
+    # _inference_single is the parent of everything indented under it; the rest
+    # of forward_test (padding, active selection, results, predictor) is the
+    # difference between the total and it.
+    m._inference_single = timed('_inference_single (whole frame pass)', m._inference_single)
+    m.extract_feat = timed('  extract_feat (backbones)', m.extract_feat)
     m.pts_bbox_head.forward = timed('  pts_bbox_head (decoder)', m.pts_bbox_head.forward)
     m.track_base.update = timed('  track_base.update (300-query loop)', m.track_base.update)
+    m.velo_update = timed('  velo_update', m.velo_update)
+    m._generate_empty_tracks = timed('_generate_empty_tracks', m._generate_empty_tracks)
     m._active_instances2results = timed('_active_instances2results', m._active_instances2results)
     # These two are nn.Module children, so __setattr__ refuses a plain function.
     # Wrapping .forward works because Module.__call__ looks up self.forward.
@@ -111,24 +114,24 @@ def main():
         if i + 1 >= args.num_warmup + args.num_timed:
             break
 
+    tot_ms = total / n * 1000
     print(f'\n=== per-frame breakdown over {n} frames ===')
-    print(f'{"stage":<40}{"ms/frame":>10}{"% total":>9}{"calls/frame":>13}')
-    acc = 0.0
+    print(f'{"stage":<42}{"ms/frame":>10}{"% total":>9}{"calls/frame":>13}')
+    # Only unindented rows are disjoint; indented ones sit inside a parent and
+    # would be double-counted if summed with it.
+    acc = sum(v for k, v in TIMES.items() if not k.startswith('  ')) / n * 1000
     for k in sorted(TIMES, key=lambda x: -TIMES[x]):
         ms = TIMES[k] / n * 1000
-        if not k.startswith('  '):
-            acc += ms
-        print(f'{k:<40}{ms:>10.1f}{100 * ms / (total / n * 1000):>8.1f}%'
+        print(f'{k:<42}{ms:>10.1f}{100 * ms / tot_ms:>8.1f}%'
               f'{CALLS[k] / n:>13.1f}')
-    tot_ms = total / n * 1000
-    print(f'{"-" * 72}')
-    print(f'{"measured total":<40}{tot_ms:>10.1f}{100.0:>8.1f}%')
-    print(f'{"sum of top-level stages":<40}{acc:>10.1f}'
+    print(f'{"-" * 74}')
+    print(f'{"measured total":<42}{tot_ms:>10.1f}{100.0:>8.1f}%')
+    print(f'{"sum of disjoint (unindented) stages":<42}{acc:>10.1f}'
           f'{100 * acc / tot_ms:>8.1f}%')
-    print(f'{"unattributed":<40}{tot_ms - acc:>10.1f}'
+    print(f'{"unattributed":<42}{tot_ms - acc:>10.1f}'
           f'{100 * (tot_ms - acc) / tot_ms:>8.1f}%')
-    print('\nIndented rows are nested inside a row above and are already '
-          'counted in it.')
+    print('\nIndented rows are nested inside the row above them and are '
+          'already included in it, so they are excluded from the sum.')
 
 
 if __name__ == '__main__':
