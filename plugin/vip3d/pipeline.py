@@ -8,6 +8,7 @@ from mmdet3d.core.points import BasePoints
 from mmdet.datasets.builder import PIPELINES
 from mmdet.datasets.pipelines import to_tensor
 from mmdet3d.datasets.pipelines import DefaultFormatBundle
+from mmdet3d.datasets.pipelines import LoadPointsFromMultiSweeps
 from mmdet3d.datasets.pipelines import (GlobalRotScaleTrans, RandomFlip3D,
                                         ObjectSample)
 from mmdet3d.datasets.pipelines.dbsampler import DataBaseSampler
@@ -1170,3 +1171,44 @@ class NormalizeMultiviewImage(object):
         repr_str = self.__class__.__name__
         repr_str += f'(mean={self.mean}, std={self.std}, to_rgb={self.to_rgb})'
         return repr_str
+
+
+@PIPELINES.register_module()
+class LoadPointsFromStridedSweeps(LoadPointsFromMultiSweeps):
+    """Multi-sweep loading that picks sweeps evenly across the whole window.
+
+    The stock transform offers two behaviours, neither of which is what we
+    want when sweeps_num is smaller than the number of available sweeps:
+    with test_mode it takes the nearest N, covering only the most recent
+    N/rate seconds, and without it it draws N at random, which makes the
+    input non-deterministic and silently turns evaluation into a sampling
+    process. Here the sweeps are strided instead, so five out of ten gives
+    indices 0, 2, 4, 6, 8 -- half the points, the same 0.5 s of history,
+    the same set every time.
+
+    The stride defaults to covering the window as evenly as the counts
+    allow. The list is subsetted before delegating, so the parent then sees
+    exactly sweeps_num sweeps and takes all of them regardless of test_mode.
+    """
+
+    def __init__(self, *args, stride=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.stride = stride
+
+    def __call__(self, results):
+        sweeps = results.get('sweeps', [])
+        if len(sweeps) > self.sweeps_num:
+            stride = self.stride or max(1, len(sweeps) // self.sweeps_num)
+            idx = list(range(0, len(sweeps), stride))[:self.sweeps_num]
+            # a stride that undershoots would drop the oldest sweeps, so top
+            # the selection up with the nearest unused ones rather than
+            # silently loading fewer than asked for
+            if len(idx) < self.sweeps_num:
+                idx += [i for i in range(len(sweeps)) if i not in idx][
+                    :self.sweeps_num - len(idx)]
+            results = dict(results, sweeps=[sweeps[i] for i in sorted(idx)])
+        return super().__call__(results)
+
+    def __repr__(self):
+        return (f'{self.__class__.__name__}(sweeps_num={self.sweeps_num}, '
+                f'stride={self.stride})')

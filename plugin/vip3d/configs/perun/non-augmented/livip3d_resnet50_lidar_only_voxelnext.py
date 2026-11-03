@@ -1,0 +1,347 @@
+_base_ = [
+    '../../_base_/nus-3d.py',
+    '../../_base_/default_runtime.py',
+    '../../_base_/heatmap_tasks.py',
+]
+workflow = [('train', 1)]
+plugin = True
+plugin_dir = 'plugin/'
+
+# Stage 1, LiDAR only, with the VoxelNeXt sparse backbone in place of
+# PointPillars + SECOND + SECONDFPN. Everything outside the LiDAR branch is
+# the same as livip3d_resnet50_lidar_only.py, and the backbone trains from
+# scratch, as the PointPillars one does.
+#
+# Backbone settings are VoxelNeXt's nuScenes ones (0.075 x 0.075 x 0.2 m
+# voxels, 10 points/voxel, 120k/160k voxels, stride 8). The range stays
+# +-51.2 m, which is hard-coded elsewhere in the repo; 102.4 / 0.075 rounds to
+# a 1365 voxel grid, so the last 2.5 cm at the +x/+y edge are dropped and the
+# 171x171 BEV (0.6 m cells) spans 102.6 m instead of 102.4 m.
+point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+voxel_size = [0.075, 0.075, 0.2]
+voxel_grid = [1365, 1365, 40]   # round(range / voxel_size), x y z
+
+img_norm_cfg = dict(
+    mean=[103.530, 116.280, 123.675], std=[1.0, 1.0, 1.0], to_rgb=False)
+
+class_names = [
+    'car', 'truck', 'bus', 'trailer',
+    'motorcycle', 'bicycle', 'pedestrian',
+]
+# prediction_eval_classes = ['car', 'pedestrian'] 
+prediction_eval_classes = [
+    'car', 'truck', 'bus', 'trailer',
+    'motorcycle', 'bicycle', 'pedestrian',
+]
+
+input_modality = dict(
+    use_lidar=True,
+    use_camera=False,
+    use_radar=False,
+    use_map=False,
+    use_external=False)
+
+model = dict(
+    type='ViP3D',
+    use_grid_mask=True,
+    num_classes=7,
+    num_query=300,
+    bbox_coder=dict(
+        type='DETRTrack3DCoder',
+        post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
+        pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0],
+        max_num=100,
+        num_classes=7),
+    fix_feats=True,   # frozen — no camera gradients, saves ~4GB activation memory
+    fix_lidar=False,
+    score_thresh=0.4,
+    filter_score_thresh=0.35,
+    use_lidar=True,
+    lidar_bev_channels=128,
+    lidar_voxel_size=voxel_size,
+    lidar_out_size_factor=8,
+    heatmap_head=dict(
+        type='LiViPHeatmapHead',
+        in_channels=128,
+        hidden_channels=64,
+        class_names=class_names,
+        tasks={{_base_.centerpoint_nusc_tasks}}),
+    pts_voxel_layer=dict(
+        max_num_points=10,
+        voxel_size=voxel_size,
+        max_voxels=(120000, 160000),
+        point_cloud_range=point_cloud_range),
+    # Mean of the points in each voxel, as VoxelNeXt's MeanVFE.
+    pts_voxel_encoder=dict(type='HardSimpleVFE', num_features=5),
+    pts_middle_encoder=dict(
+        type='VoxelNeXtBackbone',
+        in_channels=5,
+        sparse_shape=[voxel_grid[2] + 1, voxel_grid[1], voxel_grid[0]],
+        channels=[16, 32, 64, 128, 128],
+        out_channels=128),
+    # The middle encoder already returns the dense stride-8 BEV.
+    pts_backbone=None,
+    pts_neck=None,
+    qim_args=dict(
+        qim_type='QIMBase',
+        merger_dropout=0, update_query_pos=True,
+        fp_ratio=0.3, random_drop=0.1),
+    mem_cfg=dict(
+        memory_bank_type='MemoryBank',
+        memory_bank_score_thresh=0.0,
+        memory_bank_len=4,
+    ),
+    img_backbone=dict(
+        type='ResNet',
+        with_cp=False,
+        depth=50,
+        num_stages=4,
+        out_indices=(0, 1, 2, 3),
+        frozen_stages=1,
+        norm_cfg=dict(type='BN2d', requires_grad=False),
+        norm_eval=True,
+        style='caffe',
+        dcn=dict(type='DCNv2', deform_groups=1, fallback_on_stride=False),
+        stage_with_dcn=(False, False, True, True)),
+    loss_cfg=dict(
+        type='ClipMatcher',
+        num_classes=7,
+        weight_dict=None,
+        code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2],
+        assigner=dict(
+            type='HungarianAssigner3DTrack',
+            cls_cost=dict(type='FocalLossCost', weight=2.0),
+            reg_cost=dict(type='BBox3DL1Cost', weight=0.25),
+            pc_range=point_cloud_range),
+        loss_cls=dict(
+            type='FocalLoss',
+            use_sigmoid=True,
+            gamma=2.0,
+            alpha=0.25,
+            loss_weight=2.0),
+        loss_bbox=dict(type='L1Loss', loss_weight=0.25),
+        # BEV heatmap supervision for query initialisation (CenterPoint
+        # alpha/gamma). loss_weight=1.0 is the weight this term had when
+        # it was hard-coded in ViP3D._heatmap_loss.
+        loss_heatmap=dict(
+            type='GaussianFocalLoss',
+            alpha=2.0,
+            gamma=4.0,
+            loss_weight=1.0),
+    ),
+    img_neck=dict(
+        type='FPN',
+        in_channels=[256, 512, 1024, 2048],
+        out_channels=256,
+        start_level=1,
+        add_extra_convs=True,
+        num_outs=4,
+        norm_cfg=dict(type='BN2d'),
+        relu_before_extra_convs=True),
+    pts_bbox_head=dict(
+        type='TransFusionDetHead',
+        num_classes=7,
+        in_channels=256,
+        num_cams=6,
+        num_feature_levels=4,
+        transformer=dict(
+            type='TransFusionTransformer',
+            decoder=dict(
+                type='TransFusionTransformerDecoder',
+                embed_dims=256,
+                num_heads=8,
+                ffn_dims=512,
+                dropout=0.1,
+                use_smca=False,
+                lidar_bev_attn=dict(
+                    type='LiDARBEVDeformCrossAtten',
+                    embed_dims=256,
+                    num_heads=8,
+                    num_points=4,
+                    bev_in_channels=128,
+                    dropout=0.1,
+                    pc_range=point_cloud_range),
+                smca_attn=dict(
+                    type='SMCACrossAtten',
+                    embed_dims=256,
+                    num_heads=8,
+                    num_cams=6,
+                    num_levels=4,
+                    pc_range=point_cloud_range,
+                    dropout=0.1),
+            )),
+        pc_range=point_cloud_range,
+        positional_encoding=dict(
+            type='SinePositionalEncoding',
+            num_feats=128,
+            normalize=True,
+            offset=-0.5),
+    ),
+    debug=False,
+    vis_interval=20,
+    use_img_guided=False,
+    use_smca=False,
+    do_pred=True,
+    relative_pred=True,
+    agents_layer_0=True,
+    add_branch=True,
+    predictor=dict(
+        hidden_size=128,
+        laneGCN=True,
+        decoder=dict(
+            variety_loss=True,
+            variety_loss_prob=True,
+            hidden_size=128,
+        ),
+    ),
+    train_cfg=dict(
+        pts=dict(
+            grid_size=voxel_grid,
+            voxel_size=voxel_size,
+            point_cloud_range=point_cloud_range,
+            out_size_factor=8,
+            dense_reg=1,
+            gaussian_overlap=0.1,
+            max_objs=500,
+            min_radius=2,
+            code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2],
+            assigner=dict(
+                type='HungarianAssigner3D',
+                cls_cost=dict(type='FocalLossCost', weight=2.0),
+                reg_cost=dict(type='BBox3DL1Cost', weight=0.25),
+                iou_cost=dict(type='GIoU3DCost', weight=0.0),
+                pc_range=point_cloud_range)
+        )
+    ),
+)
+
+dataset_type = 'NuScenesTrackDatasetRadar'
+data_root = 'data/nuscenes/'
+file_client_args = dict(backend='disk')
+
+train_pipeline = [
+    dict(
+        type='LoadPointsFromFile',
+        coord_type='LIDAR',
+        load_dim=5,
+        use_dim=[0, 1, 2, 3, 4],
+        file_client_args=file_client_args),
+    dict(
+        type='LoadPointsFromMultiSweeps',
+        load_dim=5,
+        sweeps_num=10,
+        use_dim=[0, 1, 2, 3, 4],
+        file_client_args=file_client_args,
+        pad_empty_sweeps=True,
+        remove_close=True),
+    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
+    dict(type='InstanceRangeFilter', point_cloud_range=point_cloud_range),
+]
+train_pipeline_post = [
+    dict(type='FormatBundle3DTrack'),
+    dict(type='Collect3D', keys=[
+        'gt_bboxes_3d', 'gt_labels_3d', 'instance_inds',
+        'points', 'timestamp', 'l2g_r_mat', 'l2g_t',
+        'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels']),
+]
+
+test_pipeline = [
+    dict(
+        type='LoadPointsFromFile',
+        coord_type='LIDAR',
+        load_dim=5,
+        use_dim=5,
+        file_client_args=file_client_args),
+    dict(
+        type='LoadPointsFromMultiSweeps',
+        load_dim=5,
+        sweeps_num=10,
+        use_dim=[0, 1, 2, 3, 4],
+        file_client_args=file_client_args,
+        pad_empty_sweeps=True,
+        remove_close=True),
+    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
+]
+test_pipeline_post = [
+    dict(type='FormatBundle3DTrack'),
+    dict(type='Collect3D', keys=[
+        'gt_bboxes_3d', 'gt_labels_3d',
+        'points', 'timestamp', 'l2g_r_mat', 'l2g_t',
+        'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels']),
+]
+
+# Clips per GPU. The backbones run batched over them; tracking and prediction
+# run clip by clip and the losses are averaged (ViP3D.forward_train). The LR
+# is not rescaled with it.
+samples_per_gpu = 2 
+
+data = dict(
+    samples_per_gpu=samples_per_gpu,
+    workers_per_gpu=4,
+    train=dict(
+        type=dataset_type,
+        num_frames_per_sample=3,
+        data_root=data_root,
+        ann_file=data_root + 'nuscenes_tracking_infos_train.pkl',
+        pipeline_single=train_pipeline,
+        pipeline_post=train_pipeline_post,
+        classes=class_names,
+        modality=input_modality,
+        test_mode=False,
+        use_valid_flag=True,
+        box_type_3d='LiDAR',
+        camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'],
+        do_pred=True),
+    val=dict(
+        type=dataset_type,
+        pipeline_single=test_pipeline,
+        pipeline_post=test_pipeline_post,
+        classes=class_names,
+        modality=input_modality,
+        ann_file=data_root + 'nuscenes_tracking_infos_val.pkl',
+        num_frames_per_sample=1,
+        camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'],
+        do_pred=True),
+    test=dict(
+        type=dataset_type,
+        pipeline_single=test_pipeline,
+        pipeline_post=test_pipeline_post,
+        classes=class_names,
+        modality=input_modality,
+        ann_file=data_root + 'nuscenes_tracking_infos_val.pkl',
+        num_frames_per_sample=1,
+        camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'],
+        do_pred=True))
+
+optimizer = dict(
+    type='AdamW',
+    lr=5e-4,   # sqrt-scaled from 1e-3 at batch 64
+    paramwise_cfg=dict(
+        custom_keys={
+            'img_backbone': dict(lr_mult=0.0),  # frozen, no update needed
+            'img_neck':     dict(lr_mult=0.0),  # frozen
+            # Training from scratch, like Transfusion's first stage
+            # 'pts_backbone': dict(lr_mult=0.1),
+            # 'pts_neck':     dict(lr_mult=0.1),
+            # 'heatmap_head': dict(lr_mult=0.1),
+        }),
+    weight_decay=0.01)
+optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
+lr_config = dict(
+    policy='CosineAnnealing',
+    warmup='linear',
+    warmup_iters=350,   # ~1% of the 35k steps at batch 16
+    warmup_ratio=1.0 / 3,
+    min_lr_ratio=1e-3,
+)
+total_epochs = 20 
+# in-training DistEvalHook crashes on mmcv 1.7.2 + torch 2.1; the real
+# evaluation is env/eval_epochs.sbatch
+evaluation = dict(interval=99999)
+runner = dict(type='EpochBasedRunner', max_epochs=20)
+
+find_unused_parameters = True
+# Only the image backbone/neck are pretrained (DETR3D); the LiDAR path and
+# the heatmap head train from scratch, as in TransFusion's first stage.
+load_from = 'ckpt_init/detr3d_resnet50.pth'
+# fp16 = dict(loss_scale='dynamic')

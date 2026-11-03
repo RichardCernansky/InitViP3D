@@ -11,6 +11,7 @@ from mmcv.runner.base_module import BaseModule
 from torch.nn.init import normal_
 
 
+
 def inverse_sigmoid(x, eps=1e-5):
     """Inverse function of sigmoid.
 
@@ -704,6 +705,7 @@ class LiDARBEVDeformCrossAtten(BaseModule):
         Returns:
             [num_q, B, embed_dims]
         """
+
         inp_residual = query
         if query_pos is not None:
             query = query + query_pos

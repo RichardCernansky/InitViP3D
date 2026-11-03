@@ -206,8 +206,9 @@ class ViP3D(MVXTwoStageDetector):
         assert score_fusion in (None, 'geometric', 'arithmetic'), score_fusion
         self.score_fusion = score_fusion
         if fix_lidar and self.use_lidar:
-            for m in [self.pts_voxel_encoder, self.pts_middle_encoder,
-                      self.pts_backbone, self.pts_neck]:
+            for m in [getattr(self, n, None) for n in (
+                    'pts_voxel_encoder', 'pts_middle_encoder',
+                    'pts_backbone', 'pts_neck')]:
                 if m is not None:
                     for p in m.parameters():
                         p.requires_grad_(False)
@@ -337,7 +338,9 @@ class ViP3D(MVXTwoStageDetector):
         voxel_features = self.pts_voxel_encoder(voxels, num_points, coors)
         batch_size = coors[-1, 0] + 1
         x = self.pts_middle_encoder(voxel_features, coors, batch_size)
-        x = self.pts_backbone(x)
+        # VoxelNeXtBackbone is a middle encoder that already returns the BEV.
+        if self.with_pts_backbone:
+            x = self.pts_backbone(x)
         if self.with_pts_neck:
             x = self.pts_neck(x)
         return x

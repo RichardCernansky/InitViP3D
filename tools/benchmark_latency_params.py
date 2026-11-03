@@ -37,6 +37,11 @@ MODELS = [
     #     config='work_dirs/perun/non-augmented/s2_smca_noguide_b16/livip3d_resnet50_smca_noguide.py',
     #     checkpoint='work_dirs/perun/non-augmented/s2_smca_noguide_b16/epoch_4.pth',
     # ),
+    #     dict(
+    #     name='LiViP3D LiDAR-only (s1, b16)',
+    #     config='work_dirs/perun/non-augmented/s1_lidar_only_b8_q100/livip3d_resnet50_lidar_only.py',
+    #     checkpoint='work_dirs/perun/non-augmented/s1_lidar_only_b8_q100/epoch_13.pth',
+    # ),
 ]
 
 

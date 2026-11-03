@@ -1,3 +1,11 @@
+how do the refinement transformer layers work, how does hte smca attention work specifically?
+should i completely turn off the hd maps?
+what point is the lidar transformer l0 for single points if 
+where does the hd map flow in?
+
+otazky 18.Oct 2026
+ - is init livip is basically lidar enhanced two stage deformable detr with lidar prior
+
 (temp) riceke350@login01:~/LiViP3D$  bash -c 'source env/requirements/activate.sh && python tools/detection_eval.py \
     work_dirs/perun/non-augmented/s1_lidar_only_b16/eval/epoch_13_max'
 
