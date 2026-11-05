@@ -107,6 +107,11 @@ class ViP3D(MVXTwoStageDetector):
                 # position into its score. None (default) keeps the decoder's
                 # class score alone; 'geometric' is TransFusion's rule.
                 score_fusion=None,
+                # Inference-only: BEV radius (m). Two active tracks of the same
+                # class closer than it are one object seen twice, and the
+                # lower-scoring one is ended. Pedestrians are exempt -- they
+                # walk closer together than that. None (default) disables it.
+                dedup_radius=None,
                 # Single switch for all diagnostics: debug prints in the decoder
                 # and attention modules, and the BEV/SMCA visualisers. Off means
                 # none of them run, so no stray host syncs in the forward pass.
@@ -205,6 +210,8 @@ class ViP3D(MVXTwoStageDetector):
         self.heatmap_score_thresh = heatmap_score_thresh
         assert score_fusion in (None, 'geometric', 'arithmetic'), score_fusion
         self.score_fusion = score_fusion
+        assert dedup_radius is None or dedup_radius >= 0, dedup_radius
+        self.dedup_radius = dedup_radius
         if fix_lidar and self.use_lidar:
             for m in [getattr(self, n, None) for n in (
                     'pts_voxel_encoder', 'pts_middle_encoder',
@@ -517,6 +524,41 @@ class ViP3D(MVXTwoStageDetector):
             feat_for_queries = F_LC
 
         return heatmap, feat_for_queries
+
+    def _dedup_tracks(self, track_instances):
+        """End same-class tracks stacked on one object. Inference only.
+
+        Duplicates leave the decoder within ~0.5 m of the real box and with
+        high scores, so neither the heatmap NMS at query birth nor the score
+        threshold removes them. Active tracks are visited from the highest
+        score down; any lower-scoring track of the same class whose BEV centre
+        is closer than dedup_radius is ended; pedestrians are never merged.
+        Ending the track, not only hiding its box, also stops it carrying on
+        as a second identity in the next frames.
+        """
+        active = (track_instances.obj_idxes >= 0).nonzero(as_tuple=True)[0]
+        if len(active) < 2:
+            return
+        # class names come from the heatmap head, whose channels are in the
+        # model's class order
+        names = self.heatmap_head.class_names
+        radii = [0.0 if n == 'pedestrian' else self.dedup_radius for n in names]
+        labels = track_instances.pred_logits[active].argmax(dim=-1)
+        radius = track_instances.pred_boxes.new_tensor(radii)[labels]
+        xy = track_instances.pred_boxes[active, :2]   # metric BEV centre
+
+        # NxN matrix of BEV centre distances < radius and same class
+        close = ((torch.cdist(xy, xy) < radius[:, None])
+                 & (labels[:, None] == labels[None, :])).cpu()
+
+        keep = torch.ones(len(active), dtype=torch.bool)
+        # iterate over the scores of active tracks and sort them in descending order 
+        for i in track_instances.scores[active].argsort(descending=True).tolist():
+            if keep[i]:
+                dup = close[i] & keep
+                dup[i] = False # self is close, but not a duplicate
+                keep &= ~dup #keep kept and not duplicated
+        track_instances.obj_idxes[active[~keep.to(active.device)]] = -1
 
     def _fill_empty_slots(self, track_instances, heatmap, feat_for_queries, img_metas):
         """Seed unassigned query slots from the strongest heatmap peaks.
@@ -1190,7 +1232,10 @@ class ViP3D(MVXTwoStageDetector):
         track_instances.ref_pts = last_ref_pts[0]
 
         self.track_base.update(track_instances)
+
         # self.track_base.update_fix_label(track_instances, old_class_scores)
+        if self.dedup_radius is not None:
+            self._dedup_tracks(track_instances)
 
         if self.memory_bank is not None:
             track_instances = self.memory_bank(track_instances)

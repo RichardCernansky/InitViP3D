@@ -19,12 +19,17 @@ reuses any results_nusc.json already on disk -- no re-inference.
 Everything lands in a det/ subdirectory of each input: the converted
 results_det.json, the metrics, and the rendered curves. Prints a one-line
 summary per run.
+
+metrics_summary.json also gets a 'tp_fp_counts' entry: exact GT/TP/FP/FN
+counts per class at --pr-dist, which the devkit computes but does not save.
 """
 import argparse
 import json
 import os
 import os.path as osp
 from glob import glob
+
+import numpy as np
 
 # tracking field -> detection field
 RENAME = {'tracking_name': 'detection_name', 'tracking_score': 'detection_score'}
@@ -86,6 +91,46 @@ def pr_at_endpoint(details, cls, dist):
     return v['recall'][i], v['precision'][i], v['confidence'][i]
 
 
+def count_matches(gt_boxes, pred_boxes, classes, dist_th):
+    """-> {class: {gt, tp, fp, fn, recall, precision}} over every submitted box.
+
+    The end of the PR curve as integer counts. The devkit's accumulate() makes
+    the same TP/FP decisions but keeps only the curve interpolated onto a
+    101-point recall grid, so recall/precision read off metrics_details.json are
+    rounded to 1% and N_GT is lost. This mirrors accumulate() exactly:
+    predictions in descending score order (same tie-break), each matched to the
+    nearest still-unmatched GT box of its class in the same frame, a match being
+    BEV centre distance < dist_th. Boxes are the devkit's, after its range and
+    bike-rack filtering.
+    """
+    from nuscenes.eval.common.utils import center_distance
+
+    counts = {}
+    for cls in classes:
+        n_gt = sum(1 for b in gt_boxes.all if b.detection_name == cls)
+        preds = [b for b in pred_boxes.all if b.detection_name == cls]
+        confs = [b.detection_score for b in preds]
+        order = [i for (_, i) in sorted((v, i) for (i, v) in enumerate(confs))][::-1]
+
+        taken = set()
+        tp = 0
+        for idx in order:
+            p = preds[idx]
+            best, best_gt = np.inf, None
+            for g_idx, g in enumerate(gt_boxes[p.sample_token]):
+                if g.detection_name == cls and (p.sample_token, g_idx) not in taken:
+                    dist = center_distance(g, p)
+                    if dist < best:
+                        best, best_gt = dist, g_idx
+            if best < dist_th:
+                taken.add((p.sample_token, best_gt))
+                tp += 1
+        counts[cls] = dict(gt=n_gt, tp=tp, fp=len(preds) - tp, fn=n_gt - tp,
+                           recall=tp / n_gt if n_gt else 0.0,
+                           precision=tp / len(preds) if preds else 0.0)
+    return counts
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('eval_dirs', nargs='+',
@@ -130,6 +175,13 @@ def main():
         ev = DetectionEval(nusc, config=cfg, result_path=dst,
                            eval_set=args.eval_set, output_dir=out, verbose=False)
         m = ev.main(render_curves=not args.no_curves)
+
+        m['tp_fp_counts'] = dict(
+            dist_th=args.pr_dist,
+            per_class=count_matches(ev.gt_boxes, ev.pred_boxes,
+                                    cfg.class_names, args.pr_dist))
+        with open(osp.join(out, 'metrics_summary.json'), 'w') as f:
+            json.dump(m, f, indent=2)
         summary.append((d, m))
         print(f'    mAP={m["mean_ap"]:.4f}  NDS={m["nd_score"]:.4f}  -> {out}')
 
@@ -172,27 +224,30 @@ def main():
     print(f'\n===== precision / recall @ {args.pr_dist} m centre distance =====')
     for d, m in summary:
         details_path = osp.join(d, 'det', 'metrics_details.json')
-        if not osp.isfile(details_path):
-            print(f'\n  {d}: no metrics_details.json')
-            continue
-        with open(details_path) as f:
-            details = json.load(f)
+        details = {}
+        if osp.isfile(details_path):
+            with open(details_path) as f:
+                details = json.load(f)
         rows = []
-        for c in m['mean_dist_aps']:
+        for c, k in m['tp_fp_counts']['per_class'].items():
             pr = pr_at_endpoint(details, c, args.pr_dist)
-            if pr is not None:
-                rows.append((c, *pr, m['mean_dist_aps'][c]))
-        rows.sort(key=lambda r: -r[1])          # worst recall last: reads top-down
+            conf = pr[2] if pr is not None else float('nan')
+            rows.append((c, k, conf, m['mean_dist_aps'][c]))
+        rows.sort(key=lambda r: -r[1]['recall'])  # worst recall last: reads top-down
         print(f'\n  {d}')
         # recall/prec are at one threshold; AP is the devkit's per-class mean
         # over all four, so the two columns are not two views of one number
-        print(f'    {"class":<22}{"recall":>8}{"prec":>8}{"conf@end":>10}'
-              f'{"AP(4ths)":>10}')
-        for c, r, prec, conf, ap in rows:
-            note = '   never predicted' if r == 0 else ''
-            print(f'    {c:<22}{100 * r:>7.1f}%{100 * prec:>7.1f}%'
+        print(f'    {"class":<22}{"GT":>7}{"TP":>7}{"FP":>7}{"FN":>7}'
+              f'{"recall":>8}{"prec":>8}{"conf@end":>10}{"AP(4ths)":>10}')
+        for c, k, conf, ap in rows:
+            note = '   never predicted' if k['tp'] + k['fp'] == 0 else ''
+            print(f'    {c:<22}{k["gt"]:>7d}{k["tp"]:>7d}{k["fp"]:>7d}{k["fn"]:>7d}'
+                  f'{100 * k["recall"]:>7.1f}%{100 * k["precision"]:>7.1f}%'
                   f'{conf:>10.3f}{ap:>10.3f}{note}')
-    print('\n  recall = found / all GT in range;  prec = correct / all submitted.')
+    print('\n  GT = boxes in range;  TP = matched;  FP = submitted but unmatched;'
+          '  FN = GT never matched.')
+    print('  Counts are over every submitted box, i.e. the end of the PR curve.')
+    print('  recall = TP / GT;  prec = TP / (TP + FP).')
     # print('  conf@end is the score of the lowest-confidence box submitted. When it')
     # print('  sits at the model\'s filter_score_thresh the curve was truncated, not')
     # print('  exhausted: the detector had more boxes and the gate dropped them, so')

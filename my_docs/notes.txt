@@ -1,6 +1,8 @@
+should i put in the thesis equations of CNNs?
+run lidar only architecture from scratch on beast
 how do the refinement transformer layers work, how does hte smca attention work specifically?
 should i completely turn off the hd maps?
-what point is the lidar transformer l0 for single points if 
+what point is the lidar transformer l0 for single points if, how does it work in livip++? 
 where does the hd map flow in?
 
 otazky 18.Oct 2026

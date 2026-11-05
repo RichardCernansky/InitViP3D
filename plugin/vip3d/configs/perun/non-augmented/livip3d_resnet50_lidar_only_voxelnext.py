@@ -12,14 +12,15 @@ plugin_dir = 'plugin/'
 # the same as livip3d_resnet50_lidar_only.py, and the backbone trains from
 # scratch, as the PointPillars one does.
 #
-# Backbone settings are VoxelNeXt's nuScenes ones (0.075 x 0.075 x 0.2 m
-# voxels, 10 points/voxel, 120k/160k voxels, stride 8). The range stays
-# +-51.2 m, which is hard-coded elsewhere in the repo; 102.4 / 0.075 rounds to
-# a 1365 voxel grid, so the last 2.5 cm at the +x/+y edge are dropped and the
-# 171x171 BEV (0.6 m cells) spans 102.6 m instead of 102.4 m.
+# Backbone settings are VoxelNeXt's nuScenes ones (10 points/voxel, stride 8)
+# except the x/y voxel size: 0.05 m instead of 0.075 m, so stride 8 gives a
+# 256x256 BEV with 0.4 m cells -- the same heatmap grid as the PointPillars
+# config, and so the same cell-based NMS window, track suppression and GT
+# Gaussians. 102.4 / 0.05 = 2048 exactly, so the BEV spans exactly the range.
+# (The first run, s1_lidar_only_voxelnext_b8, used 0.075 m: 171x171, 0.6 m.)
 point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
-voxel_size = [0.075, 0.075, 0.2]
-voxel_grid = [1365, 1365, 40]   # round(range / voxel_size), x y z
+voxel_size = [0.05, 0.05, 0.2]
+voxel_grid = [2048, 2048, 40]   # range / voxel_size, x y z
 
 img_norm_cfg = dict(
     mean=[103.530, 116.280, 123.675], std=[1.0, 1.0, 1.0], to_rgb=False)
@@ -69,7 +70,9 @@ model = dict(
     pts_voxel_layer=dict(
         max_num_points=10,
         voxel_size=voxel_size,
-        max_voxels=(120000, 160000),
+        # Real frames (10 sweeps) at 0.05 m: median ~130k, p95 ~165k,
+        # max ~190k non-empty voxels, so 200k drops nothing.
+        max_voxels=(200000, 200000),
         point_cloud_range=point_cloud_range),
     # Mean of the points in each voxel, as VoxelNeXt's MeanVFE.
     pts_voxel_encoder=dict(type='HardSimpleVFE', num_features=5),
@@ -315,7 +318,9 @@ data = dict(
 
 optimizer = dict(
     type='AdamW',
-    lr=5e-4,   # sqrt-scaled from 1e-3 at batch 64
+    # For 8 GPUs x 1 clip (batch 8). The b8 runs used 3.5e-4 (sqrt-scaled
+    # from 1e-3 at batch 64); ~30% lower here.
+    lr=2.5e-4,
     paramwise_cfg=dict(
         custom_keys={
             'img_backbone': dict(lr_mult=0.0),  # frozen, no update needed
@@ -330,7 +335,7 @@ optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
 lr_config = dict(
     policy='CosineAnnealing',
     warmup='linear',
-    warmup_iters=350,   # ~1% of the 35k steps at batch 16
+    warmup_iters=1500,  # ~2% of the 70k steps at batch 8 (b8 runs used 700)
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
 )
