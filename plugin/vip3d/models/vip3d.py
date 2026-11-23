@@ -558,6 +558,8 @@ class ViP3D(MVXTwoStageDetector):
                 dup = close[i] & keep
                 dup[i] = False # self is close, but not a duplicate
                 keep &= ~dup #keep kept and not duplicated
+
+        # set obj_idxes of NOT kept to -1
         track_instances.obj_idxes[active[~keep.to(active.device)]] = -1
 
     def _fill_empty_slots(self, track_instances, heatmap, feat_for_queries, img_metas):

@@ -785,6 +785,275 @@ class LiDARBEVDeformCrossAtten(BaseModule):
         return result
 
 
+@ATTENTION.register_module()
+class LiDARBEVOffsetCrossAtten(BaseModule):
+    """Multi-point LiDAR BEV cross-attention with learned offsets.
+
+    The LiDAR part (bev_sample) of the supervisor's Detr3DCamLidarCrossAttenQGDF,
+    with the same interface as LiDARBEVDeformCrossAtten, so a config switches
+    between them by changing only `type` (and `num_points`).
+
+    The BEV map is projected to embed_dims by a 1x1 conv, group-normalised and
+    split into num_heads heads of embed_dims/num_heads channels. Every head
+    samples its own channels at num_points points: one fixed on the reference
+    point and num_points-1 moved by offsets predicted from the query, bounded
+    to +-offset_scale BEV cells by a tanh. The moving points are scored by a
+    small MLP on [sampled feature, query head, offset], softmax-normalised
+    (temperature offset_temperature) and summed into a context feature; a
+    learned gate then mixes the centre and context features per query, with a
+    learned bias that starts in favour of the centre.
+
+    With num_points=1, or offset_ablation=True, every point sits on the
+    reference point and the layer reduces to a single bilinear read.
+
+    Two departures from the original are available as switches, both off by
+    default so the default is the supervisor's method:
+      rel_offset_in_cells  feed the offset to the scoring MLP in BEV cells
+                           instead of grid_sample units (~+-0.02 on a
+                           171-cell map, next to features of order 1)
+      radial_offset_init   start the moving points on a radial pattern inside
+                           the offset range; the original sets one up but then
+                           zeroes it, so all points start on the centre
+    """
+
+    # TransFusionTransformer.init_weights re-runs this module's init_weights
+    # after its xavier pass, which would otherwise overwrite the small offset
+    # start below.
+    reinit_after_transformer = True
+
+    def __init__(self, embed_dims=256, num_heads=8, num_points=5,
+                 bev_in_channels=128, offset_scale=1.5, offset_temperature=1.5,
+                 center_logit_bias=0.25, offset_ablation=False,
+                 rel_offset_in_cells=False, radial_offset_init=False,
+                 dropout=0.1, pc_range=None, debug=False, init_cfg=None):
+        super(LiDARBEVOffsetCrossAtten, self).__init__(init_cfg)
+        assert embed_dims % num_heads == 0, (embed_dims, num_heads)
+        assert num_points >= 1, num_points
+        self.embed_dims = embed_dims
+        self.num_heads = num_heads
+        self.head_dim = embed_dims // num_heads
+        self.num_points = num_points
+        self.offset_scale = offset_scale
+        self.offset_ablation = offset_ablation
+        self.rel_offset_in_cells = rel_offset_in_cells
+        self.radial_offset_init = radial_offset_init
+        self.pc_range = pc_range
+        # see LiDARBEVDeformCrossAtten.debug
+        self.debug = debug
+        self.dropout = nn.Dropout(dropout)
+
+        self.lidar_in_proj = nn.Conv2d(bev_in_channels, embed_dims, kernel_size=1, bias=False)
+        self.lidar_in_norm2d = nn.GroupNorm(32, embed_dims)
+        if num_points > 1:
+            self.lidar_offsets = nn.Linear(embed_dims, num_heads * (num_points - 1) * 2)
+            self.lidar_attn_weights = nn.Sequential(
+                nn.Linear(2 * self.head_dim + 2, self.head_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(self.head_dim, 1))
+            self.lidar_center_ctx_gate = nn.Sequential(
+                nn.Linear(2 * embed_dims, embed_dims),
+                nn.ReLU(inplace=True),
+                nn.Linear(embed_dims, 2))
+            self.center_logit_bias = nn.Parameter(torch.tensor(float(center_logit_bias)))
+        self.lidar_out_proj = nn.Linear(embed_dims, embed_dims)
+        self.register_buffer('offset_attn_temperature', torch.tensor(float(offset_temperature)))
+        self.init_weights()
+
+    def init_weights(self):
+        if self.num_points == 1:
+            return
+        # the original's effective start: tiny weights and zero bias, so every
+        # moving point begins (almost) on the reference point
+        nn.init.xavier_uniform_(self.lidar_offsets.weight, gain=0.01)
+        nn.init.zeros_(self.lidar_offsets.bias)
+        if self.radial_offset_init:
+            # head h points in direction theta_h (square-normalised, as in the
+            # original); its moving points sit at (p+1)/num_points of the
+            # range. Set in tanh space, so none starts saturated.
+            Hh, Pm1 = self.num_heads, self.num_points - 1
+            theta = torch.arange(Hh, dtype=torch.float32) * (2 * math.pi / Hh)
+            dirs = torch.stack([theta.cos(), theta.sin()], dim=-1)
+            dirs = dirs / dirs.abs().max(dim=-1, keepdim=True)[0]           # (H, 2)
+            frac = torch.arange(1, Pm1 + 1, dtype=torch.float32) / self.num_points
+            with torch.no_grad():
+                self.lidar_offsets.bias.copy_(
+                    torch.atanh(dirs[:, None, :] * frac[None, :, None]).reshape(-1))
+
+    def forward(self, query, key=None, value=None, residual=None,
+                query_pos=None, bev_feat=None, reference_points=None, **kwargs):
+        """
+        Args:
+            query:            [num_q, B, embed_dims]
+            bev_feat:         [B, bev_in_channels, H_bev, W_bev]
+            reference_points: [B, num_q, 3]  normalised [0,1] (x,y,z in sigmoid space)
+        Returns:
+            [num_q, B, embed_dims]
+        """
+        inp_residual = query
+        if query_pos is not None:
+            query = query + query_pos
+
+        B, _, H_bev, W_bev = bev_feat.shape
+        Q = query.shape[0]
+
+        # ------------------------------------------------------------
+        # 1) Query layout -> (B, Q, E); the decoder always passes (Q, B, E)
+        # ------------------------------------------------------------
+        query = query.permute(1, 0, 2).contiguous()                      # (B,Q,E)
+
+        E = self.embed_dims
+        Hh = self.num_heads
+        D = self.head_dim
+        P = self.num_points
+
+        # ------------------------------------------------------------
+        # 2) Project LiDAR BEV features and split into heads BEFORE sampling
+        #    bev_embed_heads: (B*Hh, D, H_bev, W_bev)
+        # ------------------------------------------------------------
+        bev_embed = self.lidar_in_proj(bev_feat)                         # (B,E,H,W)
+        bev_embed = self.lidar_in_norm2d(bev_embed)                      # (B,E,H,W)
+        bev_embed_heads = bev_embed.view(B, Hh, D, H_bev, W_bev)
+        bev_embed_heads = bev_embed_heads.reshape(B * Hh, D, H_bev, W_bev)
+
+        # query split into heads
+        q_feat = query.view(B, Q, Hh, D)                                 # (B,Q,H,D)
+
+        # ------------------------------------------------------------
+        # 3) Build per-head sampling grid
+        # ------------------------------------------------------------
+        ref_xy = reference_points[..., :2]                               # (B,Q,2) in [0,1]
+        center_grid = ref_xy * 2 - 1                                     # (B,Q,2) grid_sample coords, x->W, y->H
+        center_grid = center_grid.unsqueeze(2).expand(-1, -1, Hh, -1)    # (B,Q,H,2)
+
+        center_point = center_grid.unsqueeze(3)                          # (B,Q,H,1,2)
+
+        if P == 1:
+            full_grid = center_point                                     # (B,Q,H,1,2)
+        else:
+            Pm1 = P - 1
+
+            if self.offset_ablation:
+                offsets_grid = query.new_zeros(B, Q, Hh, Pm1, 2)
+                offsets_cells = offsets_grid
+                offset_points = center_grid.unsqueeze(3).expand(-1, -1, -1, Pm1, -1)
+            else:
+                # Predict per-head offsets in CELL UNITS
+                offsets = self.lidar_offsets(query)                      # (B,Q,H*(P-1)*2)
+                offsets = offsets.view(B, Q, Hh, Pm1, 2)                 # (B,Q,H,P-1,2)
+                offsets = offsets.tanh()
+
+                # self.offset_scale is interpreted as max displacement in BEV cells
+                offsets_cells = self.offset_scale * offsets              # (B,Q,H,P-1,2)
+
+                # Convert cell offsets to grid_sample coords
+                # x: 1 cell -> 2/W, y: 1 cell -> 2/H
+                cell_to_grid = offsets_cells.new_tensor(
+                    [2.0 / W_bev, 2.0 / H_bev]
+                ).view(1, 1, 1, 1, 2)
+
+                offsets_grid = offsets_cells * cell_to_grid              # (B,Q,H,P-1,2)
+                offset_points = center_grid.unsqueeze(3) + offsets_grid  # (B,Q,H,P-1,2)
+
+                eps = 1e-4
+                offset_points = offset_points.clamp(-1.0 + eps, 1.0 - eps)
+
+            full_grid = torch.cat([center_point, offset_points], dim=3)  # (B,Q,H,P,2)
+
+        # ------------------------------------------------------------
+        # 4) Sample per-head directly
+        #
+        # full_grid:       (B,Q,H,P,2)
+        # -> reorder to    (B,H,Q,P,2)
+        # -> flatten to    (B*H, Q*P, 1, 2)
+        # ------------------------------------------------------------
+        grid_heads = full_grid.permute(0, 2, 1, 3, 4).contiguous()       # (B,H,Q,P,2)
+        grid_for_sample = grid_heads.view(B * Hh, Q * P, 1, 2)           # (B*H, QP, 1, 2)
+
+        sampled = F.grid_sample(
+            bev_embed_heads,
+            grid_for_sample,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=False,
+        )
+        # sampled: (B*H, D, QP, 1)
+        sampled = sampled.squeeze(-1).transpose(1, 2).contiguous()       # (B*H, QP, D)
+        sampled = sampled.view(B, Hh, Q, P, D)                           # (B,H,Q,P,D)
+        sampled = sampled.permute(0, 2, 1, 3, 4).contiguous()            # (B,Q,H,P,D)
+
+        # ------------------------------------------------------------
+        # 5) Split center path and offset-context path
+        # ------------------------------------------------------------
+        center_feat = sampled[:, :, :, 0, :]                             # (B,Q,H,D)
+        center_flat = center_feat.reshape(B, Q, E)                       # (B,Q,E)
+
+        if P == 1:
+            out = self.lidar_out_proj(center_flat)                       # (B,Q,E)
+        else:
+            offset_feat = sampled[:, :, :, 1:, :]                        # (B,Q,H,P-1,D)
+
+            # ------------------------------------------------------------
+            # 6) Score offset points per head using
+            #    [offset_feature || query_head || relative_offset]
+            # ------------------------------------------------------------
+            q_expanded = q_feat.unsqueeze(3).expand(-1, -1, -1, P - 1, -1)   # (B,Q,H,P-1,D)
+            # original: grid_sample units; rel_offset_in_cells switches to cells
+            rel_offsets = offsets_cells if self.rel_offset_in_cells else offsets_grid  # (B,Q,H,P-1,2)
+
+            weight_input = torch.cat([offset_feat, q_expanded, rel_offsets], dim=-1)
+            offset_logits = self.lidar_attn_weights(weight_input).squeeze(-1)    # (B,Q,H,P-1)
+
+            offset_w = F.softmax(
+                offset_logits / self.offset_attn_temperature,
+                dim=-1
+            ).unsqueeze(-1)                                              # (B,Q,H,P-1,1)
+
+            offset_ctx = (offset_feat * offset_w).sum(dim=3)             # (B,Q,H,D)
+            ctx_flat = offset_ctx.reshape(B, Q, E)                       # (B,Q,E)
+
+            # ------------------------------------------------------------
+            # 7) Fuse fixed center and offset-context explicitly
+            # ------------------------------------------------------------
+            gate_in = torch.cat([center_flat, ctx_flat], dim=-1)         # (B,Q,2E)
+            center_ctx_logits = self.lidar_center_ctx_gate(gate_in)      # (B,Q,2)
+
+            center_ctx_logits = torch.cat(
+                [
+                    center_ctx_logits[..., :1] + self.center_logit_bias,
+                    center_ctx_logits[..., 1:]
+                ],
+                dim=-1
+            )
+
+            center_ctx_w = F.softmax(
+                center_ctx_logits / self.offset_attn_temperature,
+                dim=-1
+            )                                                            # (B,Q,2)
+
+            center_w = center_ctx_w[..., 0:1]
+            ctx_w = center_ctx_w[..., 1:2]
+
+            fused = center_w * center_flat + ctx_w * ctx_flat            # (B,Q,E)
+
+            # ------------------------------------------------------------
+            # 8) Output projection
+            # ------------------------------------------------------------
+            out = self.lidar_out_proj(fused)                             # (B,Q,E)
+
+        out = out.permute(1, 0, 2).contiguous()                          # (Q,B,E)
+
+        if self.debug:
+            from . import bev_vis as _bv
+            _bv.visualize_lidar_bev_attn(bev_feat, reference_points)
+            ratio = out.norm(dim=-1).mean() / (inp_residual.norm(dim=-1).mean() + 1e-8)
+            print(f"[LiDAR-BEV-Offset] residual_ratio={ratio.item():.4f}  (>0.05=contributing)")
+            if P > 1:
+                print(f"[LiDAR-BEV-Offset] offset_mag_cells={offsets_cells.abs().mean().item():.3f}"
+                      f" (max {self.offset_scale})  centre_gate={center_w.mean().item():.3f}"
+                      f" (1=centre only)")
+
+        return self.dropout(out) + inp_residual
+
 
 # LiVip add
 @ATTENTION.register_module()
@@ -1112,5 +1381,15 @@ class SMCACrossAtten(BaseModule):
                 entropy = -(attn_vis * attn_vis.clamp(1e-10).log()).sum(-1).mean() / max_ent
                 print(f"[SMCA cam0] attn_entropy_norm={entropy.item():.3f}  (0=focused, 1=uniform)")
             print(f"[SMCA] no_cam_mask_rate={no_cam_mask.float().mean():.3f}  (0=all visible, 1=none)")
+            # Size of the camera term relative to the query it is added to, over
+            # queries seen by a camera -- the counterpart of [LiDAR-BEV-Deform]
+            # residual_ratio. pos_feat is left out: it encodes the reference
+            # point, not what the cameras saw.
+            seen = ~no_cam_mask                                    # [B, num_q]
+            if seen.any():
+                cam_norm = out.norm(dim=-1).permute(1, 0)[seen]
+                q_norm = inp_residual.norm(dim=-1).permute(1, 0)[seen]
+                print(f"[SMCA] residual_ratio={(cam_norm.mean() / (q_norm.mean() + 1e-8)).item():.4f}"
+                      f"  (camera term / query; >0.05=contributing)")
 
         return self.dropout(out) + inp_residual + pos_feat, no_cam_mask

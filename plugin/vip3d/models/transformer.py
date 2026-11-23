@@ -332,6 +332,10 @@ class TransFusionTransformer(BaseModule):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+        # modules flagged reinit_after_transformer (LiDARBEVOffsetCrossAtten) re-apply their own init, which the xavier pass above overwrote
+        for m in self.modules():
+            if getattr(m, 'reinit_after_transformer', False):
+                m.init_weights()
 
     def forward(self, mlvl_feats, query_embed, reference_points, ref_size,
                 reg_branches=None, bev_feat=None, **kwargs):

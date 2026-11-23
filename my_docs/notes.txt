@@ -1,9 +1,28 @@
-should i put in the thesis equations of CNNs?
-run lidar only architecture from scratch on beast
+check the detection/tracking metric improvements of smca not only epa
+vyskusat viac lidar layers, img guided vs. augmentation?
+check the distance improvements of smca
+onnx
+multipoint not improved
+elevate phd
+
+Future work:
+voxelnext
+img guided voxelnext
+multiple layers
+augmentation
+deduplication
+onnx model save
+
+
+?run pointpillars lidar only from pretrained
+THIS SUBMISSION check - run lidar only architecture from scratch on ail-beast
+THIS SUBMISSION main -run MULTIPLE offset points in l0 according to livip3d++ 
+THIS SUBMISSION main - pretrain lidar only point pillars on detection on batcch size 8 and the subsequent models from it 
 how do the refinement transformer layers work, how does hte smca attention work specifically?
 should i completely turn off the hd maps?
 what point is the lidar transformer l0 for single points if, how does it work in livip++? 
 where does the hd map flow in?
+should i put in the thesis equations of CNNs?
 
 otazky 18.Oct 2026
  - is init livip is basically lidar enhanced two stage deformable detr with lidar prior
